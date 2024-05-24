@@ -107,6 +107,7 @@ class SwitchTransformersConfig(PretrainedConfig):
         num_sparse_decoder_layers=3,
         num_heads=12,
         num_experts=8,
+        ep_size=1,
         router_bias=False,
         router_jitter_noise=0.01,
         router_dtype="float32",
@@ -153,6 +154,7 @@ class SwitchTransformersConfig(PretrainedConfig):
 
         self.num_heads = num_heads
         self.num_experts = num_experts
+        self.ep_size = ep_size
         self.expert_capacity = expert_capacity
         self.router_bias = router_bias
         self.router_jitter_noise = router_jitter_noise

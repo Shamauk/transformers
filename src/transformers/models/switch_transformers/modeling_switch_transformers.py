@@ -264,8 +264,11 @@ class SwitchTransformersSparseMLP(nn.Module):
     Implementation of the Switch Transformers Sparse MLP module.
     """
 
-    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense):
+    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, cuda_streams=None):
         super().__init__()
+        self.cuda_streams = cuda_streams 
+        self.num_experts = config.num_experts
+
         # Step 1: Get the correct router according to its class
         self.router = SwitchTransformersTop1Router(config)
 
@@ -296,7 +299,8 @@ class SwitchTransformersSparseMLP(nn.Module):
         next_states = hidden_states.clone()
         for idx, expert in enumerate(self.experts.values()):
             token_indices = router_mask[:, :, idx].bool()
-            next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+            with torch.cuda.stream(self.cuda_streams[idx]):
+                next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
@@ -314,7 +318,7 @@ class SwitchTransformersLayerFF(nn.Module):
             Whether the MLP layer is a `Sparse` layer (contains a Mixture of Experts) or not
     """
 
-    def __init__(self, config: SwitchTransformersConfig, is_sparse=False):
+    def __init__(self, config: SwitchTransformersConfig, is_sparse=False, cuda_streams=None):
         super().__init__()
         self.is_sparse = is_sparse
 
@@ -322,7 +326,14 @@ class SwitchTransformersLayerFF(nn.Module):
         if not self.is_sparse:
             self.mlp = SwitchTransformersDenseActDense(config)
         else:
-            self.mlp = SwitchTransformersSparseMLP(config)
+            self.mlp = SwitchTransformersSparseMLP(config, cuda_streams=cuda_streams)
+            # self.mlp = MoE(
+            #     hidden_size=config.d_model,
+            #     expert=SwitchTransformersDenseActDense(config),
+            #     num_experts=config.num_experts,
+            #     ep_size=config.ep_size,
+            #     k=1
+            # )
 
         self.layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
@@ -653,7 +664,7 @@ class SwitchTransformersLayerCrossAttention(nn.Module):
 
 
 class SwitchTransformersBlock(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False, is_sparse=False):
+    def __init__(self, config, has_relative_attention_bias=False, is_sparse=False, cuda_streams=None):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.is_sparse = is_sparse
@@ -664,7 +675,7 @@ class SwitchTransformersBlock(nn.Module):
         if self.is_decoder:
             self.layer.append(SwitchTransformersLayerCrossAttention(config))
 
-        self.layer.append(SwitchTransformersLayerFF(config, is_sparse=self.is_sparse))
+        self.layer.append(SwitchTransformersLayerFF(config, is_sparse=self.is_sparse, cuda_streams=cuda_streams))
 
     def forward(
         self,
@@ -871,7 +882,7 @@ class SwitchTransformersPreTrainedModel(PreTrainedModel):
 
 
 class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
-    def __init__(self, config, embed_tokens=None):
+    def __init__(self, config, embed_tokens=None, cuda_streams=None):
         super().__init__(config)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
@@ -888,7 +899,7 @@ class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
             is_sparse = (i % sparse_step == 1 or sparse_step == 1) if sparse_step > 0 else False
 
             self.block.append(
-                SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse)
+                SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse, cuda_streams=cuda_streams)
             )
 
         self.final_layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -1282,16 +1293,18 @@ class SwitchTransformersModel(SwitchTransformersPreTrainedModel):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
+        self.cuda_streams = [torch.cuda.Stream("cuda") for _ in range(config.num_experts)]
+
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = SwitchTransformersStack(encoder_config, self.shared)
+        self.encoder = SwitchTransformersStack(encoder_config, self.shared, self.cuda_streams)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
-        self.decoder = SwitchTransformersStack(decoder_config, self.shared)
+        self.decoder = SwitchTransformersStack(decoder_config, self.shared, self.cuda_streams)
 
         # Initialize weights and apply final processing
         self.post_init()
