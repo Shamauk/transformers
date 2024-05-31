@@ -43,6 +43,7 @@ from ...utils import (
 )
 from .configuration_switch_transformers import SwitchTransformersConfig
 
+from deepspeed.moe.layer import MoE
 
 logger = logging.get_logger(__name__)
 
@@ -276,6 +277,8 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.experts = nn.ModuleDict()
         for idx in range(config.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config)
+        
+        self.use_streams = config.use_streams
 
     def forward(self, hidden_states):
         r"""
@@ -297,10 +300,23 @@ class SwitchTransformersSparseMLP(nn.Module):
         # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
 
         next_states = hidden_states.clone()
-        for idx, expert in enumerate(self.experts.values()):
-            token_indices = router_mask[:, :, idx].bool()
-            with torch.cuda.stream(self.cuda_streams[idx]):
+        if self.use_streams:
+            for idx, expert in enumerate(self.experts.values()):
+                token_indices = router_mask[:, :, idx].bool()
+                if idx % 2 == 0:
+                    with torch.cuda.stream(self.cuda_streams[0]):
+                        expert(hidden_states[token_indices.clone()])
+                else:
+                    with torch.cuda.stream(self.cuda_streams[1]):
+                        expert(hidden_states[token_indices.clone()])
+
+            torch.cuda.synchronize("cuda")
+        else:
+            for idx, expert in enumerate(self.experts.values()):
+                token_indices = router_mask[:, :, idx].bool()
                 next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+            
+
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
@@ -321,19 +337,23 @@ class SwitchTransformersLayerFF(nn.Module):
     def __init__(self, config: SwitchTransformersConfig, is_sparse=False, cuda_streams=None):
         super().__init__()
         self.is_sparse = is_sparse
+        self.use_deepspeed_moe_layer = config.use_deepspeed_moe_layer
 
         # Check if it is a sparse layer, if not then it is a dense layer
         if not self.is_sparse:
             self.mlp = SwitchTransformersDenseActDense(config)
         else:
-            self.mlp = SwitchTransformersSparseMLP(config, cuda_streams=cuda_streams)
-            # self.mlp = MoE(
-            #     hidden_size=config.d_model,
-            #     expert=SwitchTransformersDenseActDense(config),
-            #     num_experts=config.num_experts,
-            #     ep_size=config.ep_size,
-            #     k=1
-            # )
+            if self.use_deepspeed_moe_layer:
+                self.mlp = MoE(
+                    hidden_size=config.d_model,
+                    expert=SwitchTransformersDenseActDense(config),
+                    num_experts=config.num_experts,
+                    ep_size=config.ep_size,
+                    k=1
+                )
+            else:
+                self.mlp = SwitchTransformersSparseMLP(config, cuda_streams=cuda_streams)
+            
 
         self.layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
@@ -343,7 +363,10 @@ class SwitchTransformersLayerFF(nn.Module):
         forwarded_states = self.mlp(forwarded_states)
 
         if isinstance(forwarded_states, tuple):
-            forwarded_states, router_tuple = forwarded_states
+            if self.use_deepspeed_moe_layer:
+                forwarded_states, something, something_else = forwarded_states
+            else:
+                forwarded_states, router_tuple = forwarded_states
         else:
             router_tuple = None
 
