@@ -300,26 +300,40 @@ class SwitchTransformersSparseMLP(nn.Module):
         # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
 
         next_states = hidden_states.clone()
+        token_indices_list = [router_mask[:, :, idx].bool() for idx in range(len(self.experts))]
+        intermediate_results = [torch.zeros_like(next_states) for _ in range(len(self.experts))]
         if self.use_streams:
-            for idx, expert in enumerate(self.experts.values()):
-                token_indices = router_mask[:, :, idx].bool()
-                if idx % 2 == 0:
-                    with torch.cuda.stream(self.cuda_streams[0]):
-                        expert(hidden_states[token_indices.clone()])
-                else:
-                    with torch.cuda.stream(self.cuda_streams[1]):
-                        expert(hidden_states[token_indices.clone()])
+            outputs = []
+            for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
+                if token_indices.any():
+                    with torch.cuda.stream(self.cuda_streams[idx % 2]):
+                        # res = torch.zeros_like(next_states)
+                        # res[token_indices] = expert(hidden_states[token_indices])
+                        # outputs.append(res)
+                        intermediate_results[idx][token_indices] = expert(hidden_states[token_indices])
 
-            torch.cuda.synchronize("cuda")
+            torch.cuda.synchronize()
+
+            # next_states = torch.sum(torch.stack(outputs), dim=0)
+            next_states = torch.sum(torch.stack(intermediate_results), dim=0)
         else:
-            for idx, expert in enumerate(self.experts.values()):
-                token_indices = router_mask[:, :, idx].bool()
+            for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
                 next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
             
 
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
+
+
+##### OLD 
+# calculate indices at each round
+# token_indices = router_mask[:, :, idx].bool()
+# Add simply to outputs
+# outputs.append(expert(hidden_states[token_indices]))
+# For loop to update next_states
+# for idx, val in outputs:
+#     next_states[idx] = val
 
 
 class SwitchTransformersLayerFF(nn.Module):
