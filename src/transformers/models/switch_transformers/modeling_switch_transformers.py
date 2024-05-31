@@ -301,27 +301,22 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         next_states = hidden_states.clone()
         token_indices_list = [router_mask[:, :, idx].bool() for idx in range(len(self.experts))]
-        intermediate_results = [torch.zeros_like(next_states) for _ in range(len(self.experts))]
         if self.use_streams:
             outputs = []
             for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
                 if token_indices.any():
                     with torch.cuda.stream(self.cuda_streams[idx % 2]):
-                        # res = torch.zeros_like(next_states)
-                        # res[token_indices] = expert(hidden_states[token_indices])
-                        # outputs.append(res)
-                        intermediate_results[idx][token_indices] = expert(hidden_states[token_indices])
+                        res = torch.zeros_like(next_states)
+                        res[token_indices] = expert(hidden_states[token_indices])
+                        outputs.append(res)
 
             torch.cuda.synchronize()
 
-            # next_states = torch.sum(torch.stack(outputs), dim=0)
-            next_states = torch.sum(torch.stack(intermediate_results), dim=0)
+            next_states = torch.sum(torch.stack(outputs), dim=0)
         else:
             for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
                 next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
             
-
-
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
 
