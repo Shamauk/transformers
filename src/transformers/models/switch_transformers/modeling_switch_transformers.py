@@ -44,6 +44,7 @@ from ...utils import (
 from .configuration_switch_transformers import SwitchTransformersConfig
 
 from deepspeed.moe.layer import MoE
+import nvtx
 
 logger = logging.get_logger(__name__)
 
@@ -303,31 +304,36 @@ class SwitchTransformersSparseMLP(nn.Module):
         token_indices_list = [router_mask[:, :, idx].bool() for idx in range(len(self.experts))]
         if self.use_streams:
             if self.use_streams_optimized:
-                outputs = []
-                for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
-                    if token_indices.any():
-                        with torch.cuda.stream(self.cuda_streams[idx % 2]):
-                            res = torch.zeros_like(next_states)
-                            res[token_indices] = expert(hidden_states[token_indices])
-                            outputs.append(res)
+                with nvtx.annotate("Streams Batch forward pass", color="green"):
+                    outputs = []
+                    for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
+                        if token_indices.any():
+                            with torch.cuda.stream(self.cuda_streams[idx % 2]):
+                                res = torch.zeros_like(next_states)
+                                res[token_indices] = expert(hidden_states[token_indices])
+                                with nvtx.annotate("Sharing results", color="green"):
+                                    outputs.append(res)
 
-                self.cuda_streams[0].synchronize()
-                self.cuda_streams[1].synchronize()
+                    self.cuda_streams[0].synchronize()
+                    self.cuda_streams[1].synchronize()
 
-                next_states = torch.sum(torch.stack(outputs), dim=0)
+                    with nvtx.annotate("Collection", color="green"):
+                        next_states = torch.sum(torch.stack(outputs), dim=0)
             else:
                 outputs = []
                 for idx, (expert, token_indices) in enumerate(zip(self.expert.values(), token_indices_list)):
                     if token_indices.any():
                         with torch.cuda.stream(self.cuda_streams[idx % 2]):
                             res = expert(hidden_states[token_indices])
-                            outputs.append((idx, res))
+                            with nvtx.annotate("Sharing results", color="green"):
+                                outputs.append((idx, res))
 
                 self.cuda_streams[0].synchronize()
                 self.cuda_streams[1].synchronize()
 
-                for idx, res in outputs:
-                    next_states[idx] = res
+                with nvtx.annotate("Collection", color="green"):
+                    for idx, res in outputs:
+                        next_states[idx] = res
         else:
             for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
                 next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
