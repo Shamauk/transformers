@@ -311,7 +311,8 @@ class SwitchTransformersSparseMLP(nn.Module):
                             res[token_indices] = expert(hidden_states[token_indices])
                             outputs.append(res)
 
-                torch.cuda.synchronize()
+                self.cuda_streams[0].synchronize()
+                self.cuda_streams[1].synchronize()
 
                 next_states = torch.sum(torch.stack(outputs), dim=0)
             else:
@@ -322,7 +323,8 @@ class SwitchTransformersSparseMLP(nn.Module):
                             res = expert(hidden_states[token_indices])
                             outputs.append((idx, res))
 
-                torch.cuda.synchronize()
+                self.cuda_streams[0].synchronize()
+                self.cuda_streams[1].synchronize()
 
                 for idx, res in outputs:
                     next_states[idx] = res
