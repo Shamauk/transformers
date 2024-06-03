@@ -126,6 +126,7 @@ class SwitchTransformersConfig(PretrainedConfig):
         pad_token_id=0,
         eos_token_id=1,
         use_streams=False,
+        use_streams_optimized=True,
         use_deepspeed_moe_layer=False,
         **kwargs,
     ):
@@ -179,6 +180,7 @@ class SwitchTransformersConfig(PretrainedConfig):
         self.dense_act_fn = dense_act_fn
 
         self.use_streams = use_streams
+        self.use_streams_optimized = use_streams_optimized
         self.use_deepspeed_moe_layer = use_deepspeed_moe_layer
 
         super().__init__(
