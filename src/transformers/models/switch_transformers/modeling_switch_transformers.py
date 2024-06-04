@@ -280,8 +280,17 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.experts[f"expert_{idx}"] = expert_class(config)
         
         self.use_streams = config.use_streams
+        self.use_streams_optimized = config.use_streams_optimized
 
-    def forward(self, hidden_states):
+        if not config.use_streams:
+            self.fwd = self.no_streams
+        elif not config.use_streams_optimized:
+            self.fwd = self.stream_unopt
+        else:
+            self.fwd = self.stream_opt
+
+
+    def no_streams(self, hidden_states):
         r"""
         Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
 
@@ -301,56 +310,65 @@ class SwitchTransformersSparseMLP(nn.Module):
         # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
 
         next_states = hidden_states.clone()
-        token_indices_list = [router_mask[:, :, idx].bool() for idx in range(len(self.experts))]
-        if self.use_streams:
-            if self.use_streams_optimized:
-                with nvtx.annotate("Streams Batch forward pass", color="green"):
-                    outputs = []
-                    for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
-                        if token_indices.any():
-                            with torch.cuda.stream(self.cuda_streams[idx % 2]):
-                                res = torch.zeros_like(next_states)
-                                res[token_indices] = expert(hidden_states[token_indices])
-                                with nvtx.annotate("Sharing results", color="green"):
-                                    outputs.append(res)
+        for idx, expert in enumerate(self.experts.values()):
+            token_indices = router_mask[:, :, idx].bool()
+            next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
 
-                    self.cuda_streams[0].synchronize()
-                    self.cuda_streams[1].synchronize()
-
-                    with nvtx.annotate("Collection", color="green"):
-                        next_states = torch.sum(torch.stack(outputs), dim=0)
-            else:
-                outputs = []
-                for idx, (expert, token_indices) in enumerate(zip(self.expert.values(), token_indices_list)):
-                    if token_indices.any():
-                        with torch.cuda.stream(self.cuda_streams[idx % 2]):
-                            res = expert(hidden_states[token_indices])
-                            with nvtx.annotate("Sharing results", color="green"):
-                                outputs.append((idx, res))
-
-                self.cuda_streams[0].synchronize()
-                self.cuda_streams[1].synchronize()
-
-                with nvtx.annotate("Collection", color="green"):
-                    for idx, res in outputs:
-                        next_states[idx] = res
-        else:
-            for idx, (expert, token_indices) in enumerate(zip(self.experts.values(), token_indices_list)):
-                next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
-            
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
+    
+    def stream_unopt(self, hidden_states):
+        router_mask, router_probs, router_logits = self.router(hidden_states)
+        expert_index = torch.argmax(router_mask, dim=-1)
 
+        next_states = hidden_states.clone()
+        outputs = []
+        for idx, expert in enumerate(self.experts.values()):
+            with torch.cuda.stream(self.cuda_streams[idx % 2]):
+                token_indices = router_mask[:, :, idx].bool()
+                with nvtx.annotate("Assignment", color="green"):
+                    res = expert(hidden_states[token_indices]).to(next_states.dtype)
+                with nvtx.annotate("Sharing results", color="green"):
+                    outputs.append((token_indices, res))
 
-##### OLD 
-# calculate indices at each round
-# token_indices = router_mask[:, :, idx].bool()
-# Add simply to outputs
-# outputs.append(expert(hidden_states[token_indices]))
-# For loop to update next_states
-# for idx, val in outputs:
-#     next_states[idx] = val
+        with nvtx.annotate("Synchronising at end", color="orange"):
+            self.cuda_streams[0].synchronize()
+            self.cuda_streams[1].synchronize()
 
+        with nvtx.annotate("Collection", color="green"):
+            for idx, res in outputs:
+                next_states[idx] = res
+        
+        return hidden_states, (router_logits, expert_index)
+
+    def stream_opt(self, hidden_states):
+        router_mask, router_probs, router_logits = self.router(hidden_states)
+        expert_index = torch.argmax(router_mask, dim=-1)
+
+        next_states = hidden_states.clone()
+        outputs = []
+        for idx, expert in enumerate(self.experts.values()):
+            with torch.cuda.stream(self.cuda_streams[idx % 2]):
+                token_indices = router_mask[:, :, idx].bool()
+                with nvtx.annotate("Creating vector of 0's", color="green"):
+                    res = torch.zeros_like(next_states)
+                with nvtx.annotate("Assignment", color="green"):
+                    res[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+                with nvtx.annotate("Sharing results", color="green"):
+                    outputs.append(res)
+
+        with nvtx.annotate("Synchronising at end", color="orange"):
+            self.cuda_streams[0].synchronize()
+            self.cuda_streams[1].synchronize()
+
+        with nvtx.annotate("Collection", color="green"):
+            next_states = torch.sum(torch.stack(outputs), dim=0)
+        
+        return hidden_states, (router_logits, expert_index)
+
+    
+    def forward(self, hidden_states):
+        return self.fwd(hidden_states)
 
 class SwitchTransformersLayerFF(nn.Module):
     r"""
