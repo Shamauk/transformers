@@ -45,6 +45,7 @@ from .configuration_switch_transformers import SwitchTransformersConfig
 
 from deepspeed.moe.layer import MoE
 import nvtx
+import concurrent.futures
 
 logger = logging.get_logger(__name__)
 
@@ -312,19 +313,107 @@ class SwitchTransformersSparseMLP(nn.Module):
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
     
+    # def stream_naive(self, hidden_states):
+    #     router_mask, router_probs, router_logits = self.router(hidden_states)
+    #     expert_index = torch.argmax(router_mask, dim=-1)
+
+    #     next_states = hidden_states.clone()
+    #     for idx, expert in enumerate(self.experts.values()):
+    #         with torch.cuda.stream(self.cuda_streams[idx % 2]):
+    #             token_indices = router_mask[:, :, idx].bool()
+    #             next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+
+    #     hidden_states = router_probs * next_states
+    #     return hidden_states, (router_logits, expert_index)
+
+    # def stream_naive(self, hidden_states):
+    #     router_mask, router_probs, router_logits = self.router(hidden_states)
+    #     expert_index = torch.argmax(router_mask, dim=-1)
+
+    #     next_states = hidden_states.clone()
+        
+    #     with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
+    #         futures = []
+
+    #         # Dispatch tasks to the executor
+    #         for idx, expert in enumerate(self.experts.values()):
+    #             # cuda_stream = self.cuda_streams[idx % 2]
+    #             token_indices = router_mask[:, :, idx].bool()
+
+    #             if token_indices.any():
+    #                 futures.append(executor.submit(self.run_expert, expert, hidden_states[token_indices], next_states, token_indices, self.cuda_streams[idx]))
+            
+    #         # Ensure all futures are completed
+    #         for future in concurrent.futures.as_completed(futures):
+    #             future.result()
+
+    #     hidden_states = router_probs * next_states
+    #     return hidden_states, (router_logits, expert_index)
+    
+    # def run_expert(self, expert, hidden_states, next_states, token_indices, cuda_stream):
+    #     with torch.cuda.stream(cuda_stream):
+    #         next_states[token_indices] = expert(hidden_states).to(next_states.dtype)
+
+
+    # Attempt 2
+    # def stream_naive(self, hidden_states):
+    #     router_mask, router_probs, router_logits = self.router(hidden_states)
+    #     expert_index = torch.argmax(router_mask, dim=-1)
+
+    #     next_states = hidden_states.clone()
+        
+    #     with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
+    #         futures = []
+
+    #         # Dispatch tasks to the executor
+    #         for idx, expert in enumerate(self.experts.values()):
+    #             # cuda_stream = self.cuda_streams[idx % 2]
+    #             futures.append(executor.submit(self.run_expert, idx, expert, hidden_states, next_states, router_mask, self.cuda_streams[idx]))
+            
+    #         # Ensure all futures are completed
+    #         for future in concurrent.futures.as_completed(futures):
+    #             future.result()
+
+    #     hidden_states = router_probs * next_states
+    #     return hidden_states, (router_logits, expert_index)
+    
+    # def run_expert(self, idx, expert, hidden_states, next_states, router_mask, cuda_stream):
+    #     with torch.cuda.stream(cuda_stream):
+    #         token_indices = router_mask[:, :, idx].bool()
+    #         next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+
+
+    # ATTEMPT 3
     def stream_naive(self, hidden_states):
         router_mask, router_probs, router_logits = self.router(hidden_states)
         expert_index = torch.argmax(router_mask, dim=-1)
 
         next_states = hidden_states.clone()
-        for idx, expert in enumerate(self.experts.values()):
-            with torch.cuda.stream(self.cuda_streams[idx % 2]):
-                token_indices = router_mask[:, :, idx].bool()
-                next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+
+        token_indices = []
+        for idx in range(len(self.experts)):
+            token_indices.append(router_mask[:, :, idx].bool())
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
+            futures = []
+
+            # Dispatch tasks to the executor
+            for idx, expert in enumerate(self.experts.values()):
+                # cuda_stream = self.cuda_streams[idx % 2]
+                futures.append(executor.submit(self.run_expert, idx, expert, hidden_states[token_indices[idx]], next_states[token_indices[idx]], self.cuda_streams[idx % 15]))
+            
+            # Ensure all futures are completed
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
     
+    def run_expert(self, idx, expert, hidden_states, next_states, cuda_stream):
+        with torch.cuda.stream(cuda_stream):
+            next_states = expert(hidden_states).to(next_states.dtype)
+
+
     def forward(self, hidden_states):
         return self.fwd(hidden_states)
 
@@ -367,6 +456,7 @@ class SwitchTransformersLayerFF(nn.Module):
     def forward(self, hidden_states, output_router_logits):
         forwarded_states = self.layer_norm(hidden_states)
         forwarded_states = self.mlp(forwarded_states)
+        torch.cuda.synchronize()
 
         if isinstance(forwarded_states, tuple):
             if self.use_deepspeed_moe_layer:
