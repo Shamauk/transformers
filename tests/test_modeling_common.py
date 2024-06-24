@@ -76,6 +76,7 @@ from transformers.testing_utils import (
     require_safetensors,
     require_torch,
     require_torch_gpu,
+    require_torch_multi_accelerator,
     require_torch_multi_gpu,
     require_torch_sdpa,
     slow,
@@ -1970,13 +1971,17 @@ class ModelTesterMixin:
             # Check that the model can still do a forward pass successfully (every parameter should be resized)
             model(**self._prepare_for_class(inputs_dict, model_class))
 
-    def test_model_common_attributes(self):
+    def test_model_get_set_embeddings(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
         for model_class in self.all_model_classes:
             model = model_class(config)
             self.assertIsInstance(model.get_input_embeddings(), (nn.Embedding, AdaptiveEmbedding))
-            model.set_input_embeddings(nn.Embedding(10, 10))
+
+            new_input_embedding_layer = nn.Embedding(10, 10)
+            model.set_input_embeddings(new_input_embedding_layer)
+            self.assertEqual(model.get_input_embeddings(), new_input_embedding_layer)
+
             x = model.get_output_embeddings()
             self.assertTrue(x is None or isinstance(x, nn.Linear))
 
@@ -3009,8 +3014,11 @@ class ModelTesterMixin:
             param_device = device_map[param_name]
             if param_device in ["cpu", "disk"]:
                 self.assertEqual(param.device, torch.device("meta"))
+            elif param_device in ["mps"]:
+                self.assertEqual(param.device, torch.device("mps"))
             else:
-                self.assertEqual(param.device, torch.device(param_device))
+                # when loaded with device_map, `param_device` are integer values for cuda/xpu/npu/mlu
+                self.assertEqual(param.device, torch.device(f"{torch_device}:{param_device}"))
 
     @require_accelerate
     @mark.accelerate_tests
@@ -3129,7 +3137,7 @@ class ModelTesterMixin:
 
     @require_accelerate
     @mark.accelerate_tests
-    @require_torch_multi_gpu
+    @require_torch_multi_accelerator
     def test_model_parallelism(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
@@ -3155,7 +3163,6 @@ class ModelTesterMixin:
                     new_model = model_class.from_pretrained(tmp_dir, device_map="auto", max_memory=max_memory)
                     # Making sure part of the model will actually end up offloaded
                     self.assertSetEqual(set(new_model.hf_device_map.values()), {0, 1})
-
                     self.check_device_map_is_respected(new_model, new_model.hf_device_map)
 
                     torch.manual_seed(0)
@@ -3400,7 +3407,7 @@ class ModelTesterMixin:
     @require_torch_gpu
     @mark.flash_attn_test
     @slow
-    @is_flaky
+    @is_flaky()
     def test_flash_attn_2_inference_equivalence(self):
         for model_class in self.all_model_classes:
             if not model_class._supports_flash_attn_2:
@@ -3494,7 +3501,7 @@ class ModelTesterMixin:
     @require_torch_gpu
     @mark.flash_attn_test
     @slow
-    @is_flaky
+    @is_flaky()
     def test_flash_attn_2_inference_equivalence_right_padding(self):
         for model_class in self.all_model_classes:
             if not model_class._supports_flash_attn_2:
@@ -3584,7 +3591,7 @@ class ModelTesterMixin:
     @require_torch_gpu
     @mark.flash_attn_test
     @slow
-    @is_flaky
+    @is_flaky()
     def test_flash_attn_2_generate_left_padding(self):
         for model_class in self.all_generative_model_classes:
             if not model_class._supports_flash_attn_2:
@@ -3628,7 +3635,7 @@ class ModelTesterMixin:
     @require_flash_attn
     @require_torch_gpu
     @mark.flash_attn_test
-    @is_flaky
+    @is_flaky()
     @slow
     def test_flash_attn_2_generate_padding_right(self):
         for model_class in self.all_generative_model_classes:
