@@ -267,9 +267,8 @@ class SwitchTransformersSparseMLP(nn.Module):
     Implementation of the Switch Transformers Sparse MLP module.
     """
 
-    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, cuda_streams=None):
+    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense):
         super().__init__()
-        self.cuda_streams = cuda_streams 
         self.num_experts = config.num_experts
 
         # Step 1: Get the correct router according to its class
@@ -279,14 +278,9 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.experts = nn.ModuleDict()
         for idx in range(config.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config)
-        
-        if config.use_streams:
-            self.fwd = self.stream_naive
-        else:
-            self.fwd = self.no_streams
 
 
-    def no_streams(self, hidden_states):
+    def forward(self, hidden_states):
         r"""
         Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
 
@@ -321,109 +315,9 @@ class SwitchTransformersSparseMLP(nn.Module):
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
     
-    # def stream_naive(self, hidden_states):
-    #     router_mask, router_probs, router_logits = self.router(hidden_states)
-    #     expert_index = torch.argmax(router_mask, dim=-1)
-
-    #     next_states = hidden_states.clone()
-    #     for idx, expert in enumerate(self.experts.values()):
-    #         with torch.cuda.stream(self.cuda_streams[idx % 2]):
-    #             token_indices = router_mask[:, :, idx].bool()
-    #             next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
-
-    #     hidden_states = router_probs * next_states
-    #     return hidden_states, (router_logits, expert_index)
-
-    # def stream_naive(self, hidden_states):
-    #     router_mask, router_probs, router_logits = self.router(hidden_states)
-    #     expert_index = torch.argmax(router_mask, dim=-1)
-
-    #     next_states = hidden_states.clone()
-        
-    #     with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
-    #         futures = []
-
-    #         # Dispatch tasks to the executor
-    #         for idx, expert in enumerate(self.experts.values()):
-    #             # cuda_stream = self.cuda_streams[idx % 2]
-    #             token_indices = router_mask[:, :, idx].bool()
-
-    #             if token_indices.any():
-    #                 futures.append(executor.submit(self.run_expert, expert, hidden_states[token_indices], next_states, token_indices, self.cuda_streams[idx]))
-            
-    #         # Ensure all futures are completed
-    #         for future in concurrent.futures.as_completed(futures):
-    #             future.result()
-
-    #     hidden_states = router_probs * next_states
-    #     return hidden_states, (router_logits, expert_index)
-    
-    # def run_expert(self, expert, hidden_states, next_states, token_indices, cuda_stream):
-    #     with torch.cuda.stream(cuda_stream):
-    #         next_states[token_indices] = expert(hidden_states).to(next_states.dtype)
-
-
-    # Attempt 2
-    # def stream_naive(self, hidden_states):
-    #     router_mask, router_probs, router_logits = self.router(hidden_states)
-    #     expert_index = torch.argmax(router_mask, dim=-1)
-
-    #     next_states = hidden_states.clone()
-        
-    #     with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
-    #         futures = []
-
-    #         # Dispatch tasks to the executor
-    #         for idx, expert in enumerate(self.experts.values()):
-    #             # cuda_stream = self.cuda_streams[idx % 2]
-    #             futures.append(executor.submit(self.run_expert, idx, expert, hidden_states, next_states, router_mask, self.cuda_streams[idx]))
-            
-    #         # Ensure all futures are completed
-    #         for future in concurrent.futures.as_completed(futures):
-    #             future.result()
-
-    #     hidden_states = router_probs * next_states
-    #     return hidden_states, (router_logits, expert_index)
-    
-    # def run_expert(self, idx, expert, hidden_states, next_states, router_mask, cuda_stream):
-    #     with torch.cuda.stream(cuda_stream):
-    #         token_indices = router_mask[:, :, idx].bool()
-    #         next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
-
-
-    # ATTEMPT 3
-    def stream_naive(self, hidden_states):
-        router_mask, router_probs, router_logits = self.router(hidden_states)
-        expert_index = torch.argmax(router_mask, dim=-1)
-
-        next_states = hidden_states.clone()
-
-        token_indices = []
-        for idx in range(len(self.experts)):
-            token_indices.append(router_mask[:, :, idx].bool())
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
-            futures = []
-
-            # Dispatch tasks to the executor
-            for idx, expert in enumerate(self.experts.values()):
-                # cuda_stream = self.cuda_streams[idx % 2]
-                futures.append(executor.submit(self.run_expert, idx, expert, hidden_states[token_indices[idx]], next_states[token_indices[idx]], self.cuda_streams[idx % 15]))
-            
-            # Ensure all futures are completed
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
-
-        hidden_states = router_probs * next_states
-        return hidden_states, (router_logits, expert_index)
-    
     def run_expert(self, idx, expert, hidden_states, next_states, cuda_stream):
         with torch.cuda.stream(cuda_stream):
             next_states = expert(hidden_states).to(next_states.dtype)
-
-
-    def forward(self, hidden_states):
-        return self.fwd(hidden_states)
 
 class SwitchTransformersLayerFF(nn.Module):
     r"""
@@ -437,7 +331,7 @@ class SwitchTransformersLayerFF(nn.Module):
             Whether the MLP layer is a `Sparse` layer (contains a Mixture of Experts) or not
     """
 
-    def __init__(self, config: SwitchTransformersConfig, is_sparse=False, cuda_streams=None):
+    def __init__(self, config: SwitchTransformersConfig, is_sparse=False):
         super().__init__()
         self.is_sparse = is_sparse
         self.use_deepspeed_moe_layer = config.use_deepspeed_moe_layer
@@ -455,7 +349,7 @@ class SwitchTransformersLayerFF(nn.Module):
                     k=1
                 )
             else:
-                self.mlp = SwitchTransformersSparseMLP(config, cuda_streams=cuda_streams)
+                self.mlp = SwitchTransformersSparseMLP(config)
             
 
         self.layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -791,7 +685,7 @@ class SwitchTransformersLayerCrossAttention(nn.Module):
 
 
 class SwitchTransformersBlock(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False, is_sparse=False, cuda_streams=None):
+    def __init__(self, config, has_relative_attention_bias=False, is_sparse=False):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.is_sparse = is_sparse
@@ -802,7 +696,7 @@ class SwitchTransformersBlock(nn.Module):
         if self.is_decoder:
             self.layer.append(SwitchTransformersLayerCrossAttention(config))
 
-        self.layer.append(SwitchTransformersLayerFF(config, is_sparse=self.is_sparse, cuda_streams=cuda_streams))
+        self.layer.append(SwitchTransformersLayerFF(config, is_sparse=self.is_sparse))
 
     def forward(
         self,
@@ -1009,7 +903,7 @@ class SwitchTransformersPreTrainedModel(PreTrainedModel):
 
 
 class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
-    def __init__(self, config, embed_tokens=None, cuda_streams=None):
+    def __init__(self, config, embed_tokens=None):
         super().__init__(config)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
@@ -1026,7 +920,7 @@ class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
             is_sparse = (i % sparse_step == 1 or sparse_step == 1) if sparse_step > 0 else False
 
             self.block.append(
-                SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse, cuda_streams=cuda_streams)
+                SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse)
             )
 
         self.final_layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -1420,18 +1314,16 @@ class SwitchTransformersModel(SwitchTransformersPreTrainedModel):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
-        self.cuda_streams = [torch.cuda.Stream("cuda") for _ in range(config.num_experts)]
-
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = SwitchTransformersStack(encoder_config, self.shared, self.cuda_streams)
+        self.encoder = SwitchTransformersStack(encoder_config, self.shared)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
-        self.decoder = SwitchTransformersStack(decoder_config, self.shared, self.cuda_streams)
+        self.decoder = SwitchTransformersStack(decoder_config, self.shared)
 
         # Initialize weights and apply final processing
         self.post_init()
