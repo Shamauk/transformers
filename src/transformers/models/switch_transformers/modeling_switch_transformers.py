@@ -47,6 +47,8 @@ from deepspeed.moe.layer import MoE
 import nvtx
 import concurrent.futures
 
+from huggingface_hub import snapshot_download
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "SwitchTransformersConfig"
@@ -1490,6 +1492,38 @@ class SwitchTransformersModel(SwitchTransformersPreTrainedModel):
 class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedModel):
     _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight"]
 
+
+    @classmethod
+    def from_pretrained(cls, model_name, **kwargs):
+        
+        path = snapshot_download(repo_id=model_name)
+
+        config = SwitchTransformersConfig.from_pretrained(pretrained_model_name_or_path=f"{path}/config.json", local_files_only=True)
+        for key, value in kwargs.items():
+            setattr(config, key, value)
+
+        model = cls(config)
+
+        state_dict = torch.load(f"{path}/pytorch_model.bin", map_location="cpu")
+
+        model_state_dict = model.state_dict()
+        for name, param in model_state_dict.items():
+            load_name = name
+            if "deepspeed_moe.experts" in name:
+                parts = name.split(".")
+                load_name = f"{'.'.join(parts[:6])}.experts.expert_{int(parts[9])+((config.num_experts // config.ep_size)*config.rank)}.{parts[10]}.weight"
+
+            elif "deepspeed_moe.gate" in name:
+                parts = name.split(".")
+                load_name = f"{'.'.join(parts[:6])}.router.classifier.weight"
+            try:
+                model_state_dict[name].copy_(state_dict[load_name])
+            except Exception as e:
+                    print(f"Could not load parameter {name}: {e}")
+        
+        return model
+        
+       
     def __init__(self, config: SwitchTransformersConfig):
         super().__init__(config)
         self.model_dim = config.d_model
