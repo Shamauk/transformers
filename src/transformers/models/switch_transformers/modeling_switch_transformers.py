@@ -248,7 +248,11 @@ class SwitchTransformersDenseActDense(nn.Module):
         self.dropout = nn.Dropout(config.dropout_rate)
         self.act = ACT2FN[config.dense_act_fn]
 
+        self.index = -1 
+
     def forward(self, hidden_states):
+        print(f"Forward of an expert on GPU: {torch.cuda.current_device()}")
+
         hidden_states = self.wi(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -346,7 +350,8 @@ class SwitchTransformersLayerFF(nn.Module):
                     expert=SwitchTransformersDenseActDense(config),
                     num_experts=config.num_experts,
                     ep_size=config.ep_size,
-                    k=1
+                    k=1,
+                    min_capacity=0,
                 )
             else:
                 self.mlp = SwitchTransformersSparseMLP(config)
@@ -362,7 +367,9 @@ class SwitchTransformersLayerFF(nn.Module):
 
         if isinstance(forwarded_states, tuple):
             if self.use_deepspeed_moe_layer:
-                forwarded_states, something, something_else = forwarded_states
+                forwarded_states, l_aux, exp_counts = forwarded_states
+                router_tuple = None
+                # TODO maybe want something better here :/
             else:
                 forwarded_states, router_tuple = forwarded_states
         else:
