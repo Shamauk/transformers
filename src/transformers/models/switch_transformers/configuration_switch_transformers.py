@@ -125,9 +125,7 @@ class SwitchTransformersConfig(PretrainedConfig):
         use_cache=True,
         pad_token_id=0,
         eos_token_id=1,
-        use_streams=False,
-        use_streams_optimized=True,
-        use_deepspeed_moe_layer=False,
+        num_gpus=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -179,9 +177,7 @@ class SwitchTransformersConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.dense_act_fn = dense_act_fn
 
-        self.use_streams = use_streams
-        self.use_streams_optimized = use_streams_optimized
-        self.use_deepspeed_moe_layer = use_deepspeed_moe_layer
+        self.num_gpus = num_gpus
 
         super().__init__(
             pad_token_id=pad_token_id,

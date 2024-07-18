@@ -42,10 +42,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_switch_transformers import SwitchTransformersConfig
-
-from deepspeed.moe.layer import MoE
-import nvtx
-import concurrent.futures
+import csv
 
 logger = logging.get_logger(__name__)
 
@@ -241,14 +238,22 @@ ALL_LAYERNORM_LAYERS.append(SwitchTransformersLayerNorm)
 
 # Copied from transformers.models.t5.modeling_t5.T5DenseActDense with T5->SwitchTransformers
 class SwitchTransformersDenseActDense(nn.Module):
-    def __init__(self, config: SwitchTransformersConfig):
+    def __init__(self, config: SwitchTransformersConfig, expert_idx=None, layer_idx=None):
         super().__init__()
         self.wi = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout_rate)
         self.act = ACT2FN[config.dense_act_fn]
+        self.expert_idx = expert_idx
+        self.layer_idx = layer_idx
+       
+        # self.latencies = []
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, tot_num_tokens=0):
+        # if self.expert_idx is not None:
+        #     self.start.record()
+        #     size = hidden_states.shape[0]
+
         hidden_states = self.wi(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -259,34 +264,95 @@ class SwitchTransformersDenseActDense(nn.Module):
         ):
             hidden_states = hidden_states.to(self.wo.weight.dtype)
         hidden_states = self.wo(hidden_states)
-        return hidden_states
 
+        # if self.expert_idx is not None:
+        #     self.end.record()
+        #     torch.cuda.synchronize(torch.cuda.current_device())
+        #     elapsed_time = self.start.elapsed_time(self.end)
+        #     self.latencies.append((tot_num_tokens, size, elapsed_time))
+
+        return hidden_states
+    
+    def expert_save_latencies(self, DIR=""):
+        pass
+        # with open(f"{DIR}/l{self.layer_idx}_e{self.expert_idx}.csv", "w") as f:            
+        #     fieldnames = ["Number of Tokens", "Iteration Number", "Number of Tokens Processed", "Latency (ms)"]
+        #     writer = csv.DictWriter(f, fieldnames=fieldnames)
+        #     writer.writeheader()
+        #     for i, latency_tuple in enumerate(self.latencies):
+        #         row = {"Number of Tokens": latency_tuple[0], "Number of Tokens Processed": latency_tuple[1], "Iteration Number": i, "Latency (ms)": latency_tuple[2]}
+        #         writer.writerow(row)
+
+    def expert_parallelise(self):
+        pass
+        # self.start = torch.cuda.Event(enable_timing=True)
+        # self.end = torch.cuda.Event(enable_timing=True)
 
 class SwitchTransformersSparseMLP(nn.Module):
     r"""
     Implementation of the Switch Transformers Sparse MLP module.
     """
 
-    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, cuda_streams=None):
+    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None):
         super().__init__()
-        self.cuda_streams = cuda_streams 
+        self.layer_idx = layer_idx
+
         self.num_experts = config.num_experts
+        self.num_gpus = config.num_gpus
+        self.num_experts_per_gpu = self.num_experts // self.num_gpus
+
+        self.start_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_gpus)]
+        self.end_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_gpus)]
+        self.latencies = [[] for i in range(self.num_gpus)]
+        self.num_tokens = [[[] for j in range(self.num_experts_per_gpu)] for i in range(self.num_gpus)]
+        self.tot_num_tokens = []
+
+        if self.num_gpus > 0:
+            self.num_experts_per_gpu = int(self.num_experts / self.num_gpus)
 
         # Step 1: Get the correct router according to its class
         self.router = SwitchTransformersTop1Router(config)
 
         # Step 2: Get the experts
         self.experts = nn.ModuleDict()
-        for idx in range(config.num_experts):
-            self.experts[f"expert_{idx}"] = expert_class(config)
-        
-        if config.use_streams:
-            self.fwd = self.stream_naive
-        else:
-            self.fwd = self.no_streams
+        for idx in range(self.num_experts):
+            self.experts[f"expert_{idx}"] = expert_class(config, expert_idx=idx, layer_idx=layer_idx)
+    
+    def expert_parallelise(self):
+        # Place the experts (expert_parallelism)
+        for idx in range(self.num_experts):
+            gpu_idx = idx // self.num_experts_per_gpu
+            self.experts[f"expert_{idx}"] = self.experts[f"expert_{idx}"].to(f"cuda:{gpu_idx}")
+            self.experts[f"expert_{idx}"].expert_parallelise()
+    
+    def expert_save_latencies(self, DIR=""):
+        with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
+            fieldnames = ["total number of tokens", "iteration", "expert_0 num tokens", "expert_1 num tokens", "expert_2 num tokens", "expert_3 num tokens", "expert_4 num tokens", 
+                "expert_5 num tokens", "expert_6 num tokens", "expert_7 num tokens", "gpu:0 latency (ms)", "gpu:1 latency (ms)", "gpu:2 latency (ms)", "gpu:3 latency (ms)"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            start_idx_of_cur = 0
+            cur_tot_toks = 0
+            for i in range(len(self.tot_num_tokens)):
+                if self.tot_num_tokens[i] != cur_tot_toks:
+                    start_idx_of_cur = i 
+                    cur_tot_toks = self.tot_num_tokens[i]
 
+                dic = {
+                    "total number of tokens": self.tot_num_tokens[i],
+                    "iteration": i - start_idx_of_cur,
+                }
+                for j in range(self.num_gpus):
+                    dic[f"gpu:{j} latency (ms)"] = self.latencies[j][i]
+                    for k in range(self.num_experts_per_gpu):
+                        dic[f"expert_{j * self.num_experts_per_gpu + k} num tokens"] = self.num_tokens[j][k][i]
 
-    def no_streams(self, hidden_states):
+                writer.writerow(dic)
+
+        # for idx in range(self.num_experts):
+        #     self.experts[f"expert_{idx}"].expert_save_latencies(DIR=DIR)
+
+    def forward(self, hidden_states):
         r"""
         Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
 
@@ -313,117 +379,32 @@ class SwitchTransformersSparseMLP(nn.Module):
         idx_mask = torch.nonzero(idx_mask, as_tuple=True)[
             0
         ].tolist()  # length: number of "activated" expert / value: index
-        for idx in idx_mask:
-            next_states[router_mask[:, :, idx]] = getattr(self.experts, "expert_{}".format(idx))(
-                hidden_states[router_mask[:, :, idx]]
-            )
+        if self.num_gpus == 0:
+            for idx in idx_mask:
+                next_states[router_mask[:, :, idx]] = self.experts[f"expert_{idx}"].forward(
+                    hidden_states[router_mask[:, :, idx]], tot_num_tokens=batch_size*seq_len)
+        else:
+            num_toks = hidden_states.shape[0] * hidden_states.shape[1]
+            self.tot_num_tokens.append(num_toks)
+            for gpu_idx in range(self.num_gpus):
+                self.start_events[gpu_idx].record()
+                for i in range(self.num_experts_per_gpu):
+                    idx = gpu_idx * self.num_experts_per_gpu + i
+                    num_tokens = hidden_states[router_mask[:, :, idx]].shape[0]
+                    self.num_tokens[gpu_idx][i].append(num_tokens)
+
+                    next_states[router_mask[:, :, idx]] = self.experts[f"expert_{idx}"].forward(
+                        hidden_states[router_mask[:, :, idx]].to(f"cuda:{idx // self.num_experts_per_gpu}"), tot_num_tokens=batch_size*seq_len
+                    ).to("cuda:0")
+                self.end_events[gpu_idx].record()
+                
+        torch.cuda.synchronize()
+        for i in range(self.num_gpus):
+            elapsed_time = self.start_events[i].elapsed_time(self.end_events[i])
+            self.latencies[i].append(elapsed_time)
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
-    
-    # def stream_naive(self, hidden_states):
-    #     router_mask, router_probs, router_logits = self.router(hidden_states)
-    #     expert_index = torch.argmax(router_mask, dim=-1)
-
-    #     next_states = hidden_states.clone()
-    #     for idx, expert in enumerate(self.experts.values()):
-    #         with torch.cuda.stream(self.cuda_streams[idx % 2]):
-    #             token_indices = router_mask[:, :, idx].bool()
-    #             next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
-
-    #     hidden_states = router_probs * next_states
-    #     return hidden_states, (router_logits, expert_index)
-
-    # def stream_naive(self, hidden_states):
-    #     router_mask, router_probs, router_logits = self.router(hidden_states)
-    #     expert_index = torch.argmax(router_mask, dim=-1)
-
-    #     next_states = hidden_states.clone()
-        
-    #     with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
-    #         futures = []
-
-    #         # Dispatch tasks to the executor
-    #         for idx, expert in enumerate(self.experts.values()):
-    #             # cuda_stream = self.cuda_streams[idx % 2]
-    #             token_indices = router_mask[:, :, idx].bool()
-
-    #             if token_indices.any():
-    #                 futures.append(executor.submit(self.run_expert, expert, hidden_states[token_indices], next_states, token_indices, self.cuda_streams[idx]))
-            
-    #         # Ensure all futures are completed
-    #         for future in concurrent.futures.as_completed(futures):
-    #             future.result()
-
-    #     hidden_states = router_probs * next_states
-    #     return hidden_states, (router_logits, expert_index)
-    
-    # def run_expert(self, expert, hidden_states, next_states, token_indices, cuda_stream):
-    #     with torch.cuda.stream(cuda_stream):
-    #         next_states[token_indices] = expert(hidden_states).to(next_states.dtype)
-
-
-    # Attempt 2
-    # def stream_naive(self, hidden_states):
-    #     router_mask, router_probs, router_logits = self.router(hidden_states)
-    #     expert_index = torch.argmax(router_mask, dim=-1)
-
-    #     next_states = hidden_states.clone()
-        
-    #     with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
-    #         futures = []
-
-    #         # Dispatch tasks to the executor
-    #         for idx, expert in enumerate(self.experts.values()):
-    #             # cuda_stream = self.cuda_streams[idx % 2]
-    #             futures.append(executor.submit(self.run_expert, idx, expert, hidden_states, next_states, router_mask, self.cuda_streams[idx]))
-            
-    #         # Ensure all futures are completed
-    #         for future in concurrent.futures.as_completed(futures):
-    #             future.result()
-
-    #     hidden_states = router_probs * next_states
-    #     return hidden_states, (router_logits, expert_index)
-    
-    # def run_expert(self, idx, expert, hidden_states, next_states, router_mask, cuda_stream):
-    #     with torch.cuda.stream(cuda_stream):
-    #         token_indices = router_mask[:, :, idx].bool()
-    #         next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
-
-
-    # ATTEMPT 3
-    def stream_naive(self, hidden_states):
-        router_mask, router_probs, router_logits = self.router(hidden_states)
-        expert_index = torch.argmax(router_mask, dim=-1)
-
-        next_states = hidden_states.clone()
-
-        token_indices = []
-        for idx in range(len(self.experts)):
-            token_indices.append(router_mask[:, :, idx].bool())
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.experts)) as executor:
-            futures = []
-
-            # Dispatch tasks to the executor
-            for idx, expert in enumerate(self.experts.values()):
-                # cuda_stream = self.cuda_streams[idx % 2]
-                futures.append(executor.submit(self.run_expert, idx, expert, hidden_states[token_indices[idx]], next_states[token_indices[idx]], self.cuda_streams[idx % 15]))
-            
-            # Ensure all futures are completed
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
-
-        hidden_states = router_probs * next_states
-        return hidden_states, (router_logits, expert_index)
-    
-    def run_expert(self, idx, expert, hidden_states, next_states, cuda_stream):
-        with torch.cuda.stream(cuda_stream):
-            next_states = expert(hidden_states).to(next_states.dtype)
-
-
-    def forward(self, hidden_states):
-        return self.fwd(hidden_states)
 
 class SwitchTransformersLayerFF(nn.Module):
     r"""
@@ -437,29 +418,27 @@ class SwitchTransformersLayerFF(nn.Module):
             Whether the MLP layer is a `Sparse` layer (contains a Mixture of Experts) or not
     """
 
-    def __init__(self, config: SwitchTransformersConfig, is_sparse=False, cuda_streams=None):
+    def __init__(self, config: SwitchTransformersConfig, is_sparse=False, layer_idx=None):
         super().__init__()
         self.is_sparse = is_sparse
-        self.use_deepspeed_moe_layer = config.use_deepspeed_moe_layer
 
         # Check if it is a sparse layer, if not then it is a dense layer
         if not self.is_sparse:
             self.mlp = SwitchTransformersDenseActDense(config)
         else:
-            if self.use_deepspeed_moe_layer:
-                self.mlp = MoE(
-                    hidden_size=config.d_model,
-                    expert=SwitchTransformersDenseActDense(config),
-                    num_experts=config.num_experts,
-                    ep_size=config.ep_size,
-                    k=1
-                )
-            else:
-                self.mlp = SwitchTransformersSparseMLP(config, cuda_streams=cuda_streams)
+            self.mlp = SwitchTransformersSparseMLP(config, layer_idx=layer_idx)
             
 
         self.layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
+    
+    def expert_parallelise(self):
+        if isinstance(self.mlp, SwitchTransformersSparseMLP):
+            self.mlp.expert_parallelise()
+    
+    def expert_save_latencies(self, DIR=""):
+        if isinstance(self.mlp, SwitchTransformersSparseMLP):
+            self.mlp.expert_save_latencies(DIR=DIR)
 
     def forward(self, hidden_states, output_router_logits):
         forwarded_states = self.layer_norm(hidden_states)
@@ -467,10 +446,7 @@ class SwitchTransformersLayerFF(nn.Module):
         torch.cuda.synchronize()
 
         if isinstance(forwarded_states, tuple):
-            if self.use_deepspeed_moe_layer:
-                forwarded_states, something, something_else = forwarded_states
-            else:
-                forwarded_states, router_tuple = forwarded_states
+            forwarded_states, router_tuple = forwarded_states
         else:
             router_tuple = None
 
@@ -791,7 +767,7 @@ class SwitchTransformersLayerCrossAttention(nn.Module):
 
 
 class SwitchTransformersBlock(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False, is_sparse=False, cuda_streams=None):
+    def __init__(self, config, has_relative_attention_bias=False, is_sparse=False, layer_idx=None):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.is_sparse = is_sparse
@@ -802,7 +778,17 @@ class SwitchTransformersBlock(nn.Module):
         if self.is_decoder:
             self.layer.append(SwitchTransformersLayerCrossAttention(config))
 
-        self.layer.append(SwitchTransformersLayerFF(config, is_sparse=self.is_sparse, cuda_streams=cuda_streams))
+        self.layer.append(SwitchTransformersLayerFF(config, is_sparse=self.is_sparse, layer_idx=layer_idx))
+    
+    def expert_parallelise(self):
+        for layer in self.layer:
+            if isinstance(layer, SwitchTransformersLayerFF):
+                layer.expert_parallelise()
+    
+    def expert_save_latencies(self, DIR=""):
+        for layer in self.layer:
+            if isinstance(layer, SwitchTransformersLayerFF):
+                layer.expert_save_latencies(DIR=DIR)
 
     def forward(
         self,
@@ -1009,7 +995,7 @@ class SwitchTransformersPreTrainedModel(PreTrainedModel):
 
 
 class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
-    def __init__(self, config, embed_tokens=None, cuda_streams=None):
+    def __init__(self, config, embed_tokens=None):
         super().__init__(config)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
@@ -1026,7 +1012,7 @@ class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
             is_sparse = (i % sparse_step == 1 or sparse_step == 1) if sparse_step > 0 else False
 
             self.block.append(
-                SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse, cuda_streams=cuda_streams)
+                SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse, layer_idx=i)
             )
 
         self.final_layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -1037,6 +1023,14 @@ class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
 
         self.device_map = None
         self.gradient_checkpointing = False
+    
+    def expert_parallelise(self):
+        for block in self.block:
+            block.expert_parallelise()
+    
+    def expert_save_latencies(self, DIR=""):
+        for block in self.block:
+            block.expert_save_latencies(DIR=DIR)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1420,18 +1414,16 @@ class SwitchTransformersModel(SwitchTransformersPreTrainedModel):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
-        self.cuda_streams = [torch.cuda.Stream("cuda") for _ in range(config.num_experts)]
-
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = SwitchTransformersStack(encoder_config, self.shared, self.cuda_streams)
+        self.encoder = SwitchTransformersStack(encoder_config, self.shared)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
-        self.decoder = SwitchTransformersStack(decoder_config, self.shared, self.cuda_streams)
+        self.decoder = SwitchTransformersStack(decoder_config, self.shared)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1925,11 +1917,19 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
         encoder_config.is_encoder_decoder = False
         self.encoder = SwitchTransformersStack(encoder_config, self.shared)
 
+        self.num_gpus = config.num_gpus
+        if self.num_gpus > 0:
+            self.encoder = self.encoder.to("cuda:0")
+            self.encoder.expert_parallelise()
+
         # Initialize weights and apply final processing
         self.post_init()
 
         # Model parallel
         self.device_map = None
+    
+    def expert_save_latencies(self, DIR=""):
+        self.encoder.expert_save_latencies(DIR=DIR)
 
     def get_input_embeddings(self):
         return self.shared
@@ -1983,6 +1983,16 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
         >>> last_hidden_states = outputs.last_hidden_state
         ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if self.num_gpus > 0:
+            if input_ids is not None:
+                input_ids = input_ids.to("cuda:0")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to("cuda:0")
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds.to("cuda:0")
+            if head_mask is not None:
+                head_mask = head_mask.to("cuda:0")
 
         encoder_outputs = self.encoder(
             input_ids=input_ids,
