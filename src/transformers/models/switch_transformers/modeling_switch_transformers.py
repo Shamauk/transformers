@@ -273,30 +273,25 @@ class SwitchTransformersDenseActDenseFused(nn.Module):
         self.dropout = nn.Dropout(config.dropout_rate)
         self.act = ACT2FN[config.dense_act_fn]
 
-        self.wis = nn.Parameter(torch.zeros(num_experts, config.d_ff, config.d_model))
-        self.wos = nn.Parameter(torch.zeros(num_experts, config.d_model, config.d_ff))
+        # These are transposed the 1st and 2nd index of the original to enable bmm
+        self.wis = nn.Parameter(torch.zeros(num_experts, config.d_model, config.d_ff))
+        self.wos = nn.Parameter(torch.zeros(num_experts, config.d_ff, config.d_model))
 
         self.experts = []
     
     def forward(self, hidden_states, idxs=None):
-        hidden_states = hidden_states.transpose(1, 2)
         if idxs is None:
-            hidden_states = torch.bmm(self.wis, hidden_states)
+            hidden_states = torch.bmm(hidden_states, self.wis)
         else:
-            hidden_states = torch.bmm(self.wis[idxs, :, :], hidden_states)
-
-        hidden_states = hidden_states.transpose(1, 2)
+            hidden_states = torch.bmm(hidden_states, self.wis[idxs, :, :])
 
         hidden_states = self.act(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
-        hidden_states = hidden_states.transpose(1, 2)
         if idxs is None:
-            hidden_states = torch.bmm(self.wos, hidden_states)
+            hidden_states = torch.bmm(hidden_states, self.wos)
         else:
-            hidden_states = torch.bmm(self.wos[idxs, :, :], hidden_states)
-
-        hidden_states = hidden_states.transpose(1, 2)
+            hidden_states = torch.bmm(hidden_states, self.wos[idxs, :, :])
 
         return hidden_states
 
@@ -339,9 +334,10 @@ class SwitchTransformersSparseMLP(nn.Module):
     def expert_parallelise(self):
         # Create the offload on the final GPU
         self.offload = SwitchTransformersDenseActDenseFused(self.config, self.num_experts)
-        wis_tensor = torch.stack([self.experts[f"expert_{idx}"].wi.weight for idx in range(self.num_experts)])
+        wis_tensor = torch.stack([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in range(self.num_experts)])
         self.offload.wis.data.copy_(wis_tensor)
-        wos_tensor = torch.stack([self.experts[f"expert_{idx}"].wo.weight for idx in range(self.num_experts)])
+        print(f"Modified wis: {self.offload.wis.shape}")
+        wos_tensor = torch.stack([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in range(self.num_experts)])
         self.offload.wos.data.copy_(wos_tensor)
         self.offload.experts = range(self.num_experts)
         self.offload = self.offload.to(f"cuda:{self.num_gpus-1}")
@@ -360,8 +356,8 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.gpu_experts[f"gpu_{gpu_idx}"] = SwitchTransformersDenseActDenseFused(self.config, num_to_allocate)
             
             for i in range(num_to_allocate):
-                self.gpu_experts[f"gpu_{gpu_idx}"].wis[i].data.copy_(self.experts[f"expert_{cur_expert}"].wi.weight)
-                self.gpu_experts[f"gpu_{gpu_idx}"].wos[i].data.copy_(self.experts[f"expert_{cur_expert}"].wo.weight)
+                self.gpu_experts[f"gpu_{gpu_idx}"].wis[i].data.copy_(self.experts[f"expert_{cur_expert}"].wi.weight.transpose(0,1))
+                self.gpu_experts[f"gpu_{gpu_idx}"].wos[i].data.copy_(self.experts[f"expert_{cur_expert}"].wo.weight.transpose(0,1))
                 self.gpu_experts[f"gpu_{gpu_idx}"].experts.append(cur_expert)
                 self.gpu_idx_and_offset_to_expert[gpu_idx].append(cur_expert)
                 self.expert_to_gpu_idx[cur_expert] = gpu_idx
