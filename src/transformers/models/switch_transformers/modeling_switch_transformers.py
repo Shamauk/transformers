@@ -45,7 +45,9 @@ from .configuration_switch_transformers import SwitchTransformersConfig
 import csv
 
 import threading
-import queue
+from queue import Queue
+
+import torch.multiprocessing as mp
 
 logger = logging.get_logger(__name__)
 
@@ -56,6 +58,10 @@ _CHECKPOINT_FOR_DOC = "google/switch-base-8"
 # This dict contains ids and associated url
 # for the pretrained weights provided with the models
 ####################################################
+
+
+# if __name__ == '__main__':
+#     mp.set_start_method('spawn')
 
 
 def router_z_loss_func(router_logits: torch.Tensor) -> float:
@@ -394,9 +400,13 @@ class SwitchTransformersSparseMLP(nn.Module):
 
                 writer.writerow(dic)
 
-    def process_tokens_on_gpu(self, gpu_idx, hidden_states, router_mask, next_states, expert_to_offload, max_tokens_to_a_single_expert, num_tokens_to_rebalance):
-        self.start_events[gpu_idx].record()
+    def process_tokens_on_gpu(self, gpu_idx, hidden_states, router_mask, next_states, queue, expert_to_offload, max_tokens_to_a_single_expert, num_tokens_to_rebalance):
+        torch.cuda.set_device(gpu_idx)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
         
+        start_event.record()
+
         stack = []
         largest = max_tokens_to_a_single_expert
         sizes = []
@@ -417,21 +427,46 @@ class SwitchTransformersSparseMLP(nn.Module):
         tokens = torch.stack(stack)
         response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens).to("cuda:0", non_blocking=True)
 
-        for idx, size in enumerate(sizes):
-            expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][idx]
-            if expert_idx == expert_to_offload and num_tokens_to_rebalance > 0:
-                next_states[router_mask[:, :, expert_idx]][:-num_tokens_to_rebalance, :] = response[idx, :size]
-            else:
-                next_states[router_mask[:, :, expert_idx]] = response[idx, :size]
+        end_event.record()
+        torch.cuda.synchronize(gpu_idx)
+        elapsed_time = start_event.elapsed_time(end_event)
 
-        self.end_events[gpu_idx].record()
+        if num_tokens_to_rebalance > 0:
+            inclusion_experts = self.gpu_idx_and_offset_to_expert[gpu_idx][:]
+            inclusion_idx = list(range(len(inclusion_experts)))
+            idx_of_offload = inclusion_experts.index(expert_to_offload)
+            inclusion_experts.pop(idx_of_offload)
+            inclusion_idx.pop(idx_of_offload)
+            size_offload = sizes[idx_of_offload]
+            sizes.pop(idx_of_offload)
 
-    def process_offload_gpu(self, offloaded, hidden_states, router_mask, next_states):
-        self.num_token_each_gpu[self.num_gpus-1].append(sum(offloaded))
-        self.start_events[self.num_gpus-1].record()
+            queue.put({
+                "latency": elapsed_time,
+                "mask": router_mask[:, :, inclusion_experts],
+                "states": response[inclusion_idx, :, :],
+                "sizes": sizes,
+                "mask-offload": router_mask[:, :, expert_to_offload],
+                "states-offload": response[idx_of_offload, :size_offload, :],
+                "size-offload": size_offload
+            })
+        else:
+            queue.put({
+                "latency": elapsed_time,
+                "mask": router_mask[:, :, self.gpu_idx_and_offset_to_expert[gpu_idx]],
+                "states": response,
+                "sizes": sizes,
+            })
+
+
+    def process_offload_gpu(self, gpu_idx, offloaded, largest, hidden_states, router_mask, next_states, queue):
+        torch.cuda.set_device(gpu_idx)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+
         stack = []
         idxs = []
-        largest = max(offloaded)
         for idx in range(self.num_experts):
             if offloaded[idx] > 0:
                 data = hidden_states[router_mask[:, :, idx]][-offloaded[idx]:,:].to(f"cuda:{self.num_gpus-1}", non_blocking=True)
@@ -442,10 +477,15 @@ class SwitchTransformersSparseMLP(nn.Module):
         tokens = torch.stack(stack)
         response = self.offload(tokens, idxs=idxs).to("cuda:0", non_blocking=True)
 
-        for i, idx in enumerate(idxs):
-            next_states[router_mask[:, :, idx]][-offloaded[idx]:, :] = response[i, :offloaded[idx], :]
-
-        self.end_events[self.num_gpus-1].record()
+        end_event.record()
+        torch.cuda.synchronize(gpu_idx)
+        elapsed_time = start_event.elapsed_time(end_event)
+        queue.put({
+            "latency": elapsed_time,
+            'mask': [router_mask[:, :, idx] for idx in idxs],
+            'states': response,
+            'offloaded': [offloaded[idx] for idx in idxs]
+        })
 
 
     def forward(self, hidden_states):
@@ -520,15 +560,20 @@ class SwitchTransformersSparseMLP(nn.Module):
                 expert_to_offload_list[gpu_idx] = max_index
                 max_tokens_to_a_single_expert_list[gpu_idx] = max(max_tokens_to_a_single_expert - num_tokens_to_rebalance, second_largest_num_tokens_to_a_single_expert)
                 num_tokens_to_rebalance_list[gpu_idx] = num_tokens_to_rebalance
-
+            
+            self.num_token_each_gpu[self.num_gpus-1].append(sum(offloaded))
+            largest_offloaded_amt = max(offloaded)
            
             threads = []
+            queues = [Queue() for _ in range(self.num_gpus)]
             for gpu_idx in range(self.num_gpus):
                 if gpu_idx == self.num_gpus - 1:
                     thread = threading.Thread(target=self.process_offload_gpu, args=(
+                        gpu_idx,
                         offloaded, 
+                        largest_offloaded_amt,
                         hidden_states,
-                        router_mask, next_states
+                        router_mask, next_states, queues[gpu_idx]
                     ))
                 else:
                     thread = threading.Thread(target=self.process_tokens_on_gpu, args=(
@@ -536,23 +581,32 @@ class SwitchTransformersSparseMLP(nn.Module):
                         hidden_states,
                         router_mask,
                         next_states,
+                        queues[gpu_idx],
                         expert_to_offload_list[gpu_idx], 
                         max_tokens_to_a_single_expert_list[gpu_idx],
                         num_tokens_to_rebalance_list[gpu_idx]
                     ))
                 thread.start()
                 threads.append(thread)
-            #######################
-        
-        for thread in threads:
-            thread.join()
+
+            for gpu_idx in range(self.num_gpus):
+                result = queues[gpu_idx].get()
+                self.latencies[gpu_idx].append(result['latency'])
+                if "offloaded" in result:
+                    for idx, offload in enumerate(result["offloaded"]):
+                        next_states[result["mask"][idx]][-offload:, :] = result["states"][idx, :offload, :]
+                else:
+                    for idx, size in enumerate(result["sizes"]):
+                        next_states[result["mask"][:, :, idx]] = result["states"][idx, :size, :]
+                    if "mask-offload" in result:
+                        next_states[result["mask-offload"]][:result["size-offload"], :] = result["states-offload"]
+
+            for thread in threads:
+                thread.join()
+
+           
                 
         torch.cuda.synchronize()
-
-        for i in range(self.num_gpus):
-            elapsed_time = self.start_events[i].elapsed_time(self.end_events[i])
-            self.latencies[i].append(elapsed_time)
-
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
 
