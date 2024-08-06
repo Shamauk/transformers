@@ -48,6 +48,7 @@ import threading
 from queue import Queue
 
 import torch.multiprocessing as mp
+import stk
 
 logger = logging.get_logger(__name__)
 
@@ -301,6 +302,35 @@ class SwitchTransformersDenseActDenseFused(nn.Module):
 
         return hidden_states
 
+class SwitchTransformersDenseActDenseFusedSparse(nn.Module):
+    def __init__(self, config: SwitchTransformersConfig, num_experts):
+        super().__init__()
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.act = ACT2FN[config.dense_act_fn]
+
+        inner_dim = config.d_ff * num_experts
+        self.wis = nn.Parameter(torch.empty(config.d_model, inner_dim))
+        self.wos = nn.Parameter(torch.empty(inner_dim, config.d_model))
+
+        self.experts = []
+    
+    def forward(self, hidden_states, topo, idxs=None):
+        if idxs is None:
+            hidden_states = stk.ops.sdd(hidden_states, self.wis, topo)
+        else:
+            hidden_states = stk.ops.sdd(hidden_states, self.wis[idxs, :, :], topo)
+        
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+
+        if idxs is None:
+            hidden_states = stk.ops.dsd(hidden_states, self.wos)
+        else:
+            hidden_states = stk.ops.dsd(hidden_states, self.wos)
+        
+        return hidden_states
+
+
 class SwitchTransformersSparseMLP(nn.Module):
     r"""
     Implementation of the Switch Transformers Sparse MLP module.
@@ -339,11 +369,10 @@ class SwitchTransformersSparseMLP(nn.Module):
     # Assumption that the offload GPU will be the last one
     def expert_parallelise(self):
         # Create the offload on the final GPU
-        self.offload = SwitchTransformersDenseActDenseFused(self.config, self.num_experts)
-        wis_tensor = torch.stack([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in range(self.num_experts)])
+        self.offload = SwitchTransformersDenseActDenseFusedSparse(self.config, self.num_experts)
+        wis_tensor = torch.cat([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in range(self.num_experts)], dim=1)
         self.offload.wis.data.copy_(wis_tensor)
-        print(f"Modified wis: {self.offload.wis.shape}")
-        wos_tensor = torch.stack([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in range(self.num_experts)])
+        wos_tensor = torch.cat([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in range(self.num_experts)], dim=0)
         self.offload.wos.data.copy_(wos_tensor)
         self.offload.experts = range(self.num_experts)
         self.offload = self.offload.to(f"cuda:{self.num_gpus-1}")
@@ -359,17 +388,22 @@ class SwitchTransformersSparseMLP(nn.Module):
                 num_to_allocate += 1
                 extras_to_allocate -= 1
 
-            self.gpu_experts[f"gpu_{gpu_idx}"] = SwitchTransformersDenseActDenseFused(self.config, num_to_allocate)
-            
-            for i in range(num_to_allocate):
-                self.gpu_experts[f"gpu_{gpu_idx}"].wis[i].data.copy_(self.experts[f"expert_{cur_expert}"].wi.weight.transpose(0,1))
-                self.gpu_experts[f"gpu_{gpu_idx}"].wos[i].data.copy_(self.experts[f"expert_{cur_expert}"].wo.weight.transpose(0,1))
-                self.gpu_experts[f"gpu_{gpu_idx}"].experts.append(cur_expert)
-                self.gpu_idx_and_offset_to_expert[gpu_idx].append(cur_expert)
-                self.expert_to_gpu_idx[cur_expert] = gpu_idx
-                cur_expert += 1
+            self.gpu_experts[f"gpu_{gpu_idx}"] = SwitchTransformersDenseActDenseFusedSparse(self.config, num_to_allocate)
+
+            experts = range(cur_expert, cur_expert+num_to_allocate)
+            wis_tensor = torch.cat([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in experts], dim=1)
+            self.gpu_experts[f"gpu_{gpu_idx}"].wis.data.copy_(wis_tensor)
+            wos_tensor = torch.cat([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in experts], dim=0)
+            self.gpu_experts[f"gpu_{gpu_idx}"].wos.data.copy_(wos_tensor)
+            self.gpu_experts[f"gpu_{gpu_idx}"].experts = experts
+            self.gpu_idx_and_offset_to_expert[gpu_idx] = experts
+            for e_idx in experts:
+               self.expert_to_gpu_idx[e_idx] = gpu_idx
+            cur_expert += num_to_allocate
 
             self.gpu_experts[f"gpu_{gpu_idx}"] = self.gpu_experts[f"gpu_{gpu_idx}"].to(f"cuda:{gpu_idx}")
+        
+        print("Finished loading weights on sparse matrix")
 
     def expert_save_latencies(self, DIR=""):
         with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
@@ -407,25 +441,47 @@ class SwitchTransformersSparseMLP(nn.Module):
         
         start_event.record()
 
-        stack = []
-        largest = max_tokens_to_a_single_expert
-        sizes = []
+        x = []
         for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
             expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
             data = hidden_states[router_mask[:, :, expert_idx]].to(f"cuda:{gpu_idx}", non_blocking=True)
             if expert_idx == expert_to_offload and num_tokens_to_rebalance > 0:
                 data = data[:-num_tokens_to_rebalance, :]
-                pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{gpu_idx}", non_blocking=True)
-                stack.append(torch.cat((data, pad), dim=0))
-                sizes.append(data.shape[0])
-            else:
-                pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{gpu_idx}", non_blocking=True)
-                stack.append(torch.cat((data, pad), dim=0))
-                sizes.append(data.shape[0])
+            x.append(data)
+        
+        tokens = torch.cat(x, axis=0)
+        print(tokens.shape)
+        response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens, topo).to("cuda:0", non_blocking=True)
+        print(response.shape)
+        exit(1)
+
+        # (num_toks, d_model)
+        # x = hidden_states[router_mask[:, :, self.gpu_idx_and_offset_to_expert[gpu_idx]]].to(f"cuda:{gpu_idx}", non_blocking=True)
+        # print(x.shape)
+        # exit(1)
+        # if expert_to_offload in self.gpu_idx_and_offset_to_expert[gpu_idx]:
+        #     i = self.gpu_idx_and_offset_to_expert[gpu_idx].index(expert_to_offload)
 
 
-        tokens = torch.stack(stack)
-        response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens).to("cuda:0", non_blocking=True)
+        # stack = []
+        # largest = max_tokens_to_a_single_expert
+        # sizes = []
+        # for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
+        #     expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
+        #     data = hidden_states[router_mask[:, :, expert_idx]].to(f"cuda:{gpu_idx}", non_blocking=True)
+        #     if expert_idx == expert_to_offload and num_tokens_to_rebalance > 0:
+        #         data = data[:-num_tokens_to_rebalance, :]
+        #         pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{gpu_idx}", non_blocking=True)
+        #         stack.append(torch.cat((data, pad), dim=0))
+        #         sizes.append(data.shape[0])
+        #     else:
+        #         pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{gpu_idx}", non_blocking=True)
+        #         stack.append(torch.cat((data, pad), dim=0))
+        #         sizes.append(data.shape[0])
+
+
+        # tokens = torch.stack(stack)
+        # response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens).to("cuda:0", non_blocking=True)
 
         end_event.record()
         torch.cuda.synchronize(gpu_idx)
@@ -459,6 +515,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
 
     def process_offload_gpu(self, gpu_idx, offloaded, largest, hidden_states, router_mask, next_states, queue):
+        return
         torch.cuda.set_device(gpu_idx)
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
