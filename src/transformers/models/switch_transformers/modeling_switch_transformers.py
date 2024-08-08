@@ -450,6 +450,15 @@ class SwitchTransformersSparseMLP(nn.Module):
             x.append(data)
         
         tokens = torch.cat(x, axis=0)
+        shape = (tokens.shape[0], self.config.d_ff * len(self.gpu_idx_and_offset_to_expert[gpu_idx]))
+        # Not used (so reserved in meta)
+        data = torch.empty(
+            400,
+            128,
+            128,
+            device="meta"
+        )
+        topo = stk.Matrix(shape, data, )
         print(tokens.shape)
         response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens, topo).to("cuda:0", non_blocking=True)
         print(response.shape)
