@@ -48,6 +48,8 @@ import threading
 from queue import Queue
 
 import torch.multiprocessing as mp
+import nvtx 
+from torch.cuda.comm import reduce_add
 # import stk
 
 logger = logging.get_logger(__name__)
@@ -417,7 +419,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         stack = []
         pads = []
         for _input in inputs:
-            pad = torch.zeros((largest-_input.shape[0],_input.shape[1])).to(_input.device, non_blocking=True)
+            pad = torch.zeros((largest-_input.shape[0],_input.shape[1]), device=_input.device)
             stack.append(torch.cat((_input, pad), dim=0))
             pads.append(pad.shape[0])
         return torch.stack(stack), pads
@@ -441,6 +443,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         # Calculate amount to be offloaded
         offloaded = [0 for _ in range(self.num_experts)]
+        num_toks_each_gpu = [0 for _ in range(self.num_gpus)]
 
         for gpu_idx in range(self.num_gpus-1):
             num_tokens_for_gpu = 0
@@ -461,9 +464,11 @@ class SwitchTransformersSparseMLP(nn.Module):
 
             # Then rebalance 
             ## Get number of tokens to rebalance
-            num_tokens_to_rebalance = num_tokens_for_gpu - int(avg_num_toks * 1.15)
+            num_tokens_to_rebalance = num_tokens_for_gpu - int(avg_num_toks * 1.1)
             num_tokens_to_rebalance = max(0, num_tokens_to_rebalance)
-            self.num_token_each_gpu[gpu_idx].append(num_tokens_for_gpu - num_tokens_to_rebalance)
+            num_toks_each_gpu[gpu_idx] = num_tokens_for_gpu - num_tokens_to_rebalance
+            self.num_token_each_gpu[gpu_idx].append(num_toks_each_gpu[gpu_idx])
+            
             if num_tokens_to_rebalance > 0:
                 # We will rebalance the tokens from the expert with the most
                 offloaded[max_index] = num_tokens_to_rebalance
@@ -486,35 +491,239 @@ class SwitchTransformersSparseMLP(nn.Module):
 
 
         # Dealing with the offloaded 
-        self.num_token_each_gpu[self.num_gpus-1].append(sum(offloaded))
+        _sum = 0
+        offload_experts_idx = []
+        for idx, val in enumerate(offloaded):
+            if val > 0:
+                _sum += val
+                offload_experts_idx.append(idx)
+        num_toks_each_gpu[-1] = _sum
+
+        self.num_token_each_gpu[-1].append(num_toks_each_gpu[-1])
         largest_offloaded_amt = max(offloaded)
         _in, _p = self.pad_input([hidden_states[masks[i]][-offloaded[i]:] for i in range(self.num_experts) if offloaded[i] > 0], largest_offloaded_amt)
         inputs_to_send[-1] = _in
         paddings[-1] = _p
-       
 
-        for gpu_idx in range(self.num_gpus):
+
+        # def process_gpu(gpu_idx):
+        #     self.start_events[gpu_idx].record()
+        #     with torch.cuda.stream(self.comm_in_stream):
+        #         _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+        #         self.comm_in_events[gpu_idx].record()
+            
+        #     with torch.cuda.stream(self.comp_streams[gpu_idx]):
+        #         self.comm_in_events[gpu_idx].wait()
+        #         if gpu_idx != self.num_gpus-1:
+        #             _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+        #         else:
+        #             _output = self.offload.forward(_input, idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
+        #         outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
+        #     self.end_events[gpu_idx].record()
+
+        # threads = []
+        # gpu_tokens = list(enumerate(num_toks_each_gpu))
+        # sorted_gpu_tokens = sorted(gpu_tokens, key=lambda x: x[1], reverse=True)
+        # for (gpu_idx,_) in sorted_gpu_tokens:
+        #     thread = threading.Thread(target=process_gpu, args=(gpu_idx,))
+        #     thread.start()
+        #     threads.append(thread)
+
+        # for thread in threads:
+        #     thread.join()
+
+        # torch.cuda.synchronize()
+
+        # Perform in the order of number of tokens
+        gpu_tokens = list(enumerate(num_toks_each_gpu))
+        sorted_gpu_tokens = sorted(gpu_tokens, key=lambda x: x[1], reverse=True)
+
+
+
+        # inputs = [None for _ in range(self.num_gpus)]
+
+        # with torch.cuda.stream(self.comm_in_stream):
+        #     for (gpu_idx, _) in sorted_gpu_tokens:
+        #         self.start_events[gpu_idx].record()
+        #         inputs[gpu_idx] = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+        #         self.comm_in_events[gpu_idx].record()
+
+        # outputs_to_send = [None for _ in range(self.num_gpus)]
+
+        # for (gpu_idx,_) in sorted_gpu_tokens:
+        #     with torch.cuda.stream(self.comp_streams[gpu_idx]):
+        #         self.comm_in_events[gpu_idx].wait()
+        #         if gpu_idx != self.num_gpus-1:
+        #             _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(inputs[gpu_idx])
+        #         else:
+        #             _output = self.offload.forward(inputs[gpu_idx], idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
+        #         outputs_to_send[gpu_idx] = _output
+        #         self.comm_out_events[gpu_idx].record()
+
+        # for (gpu_idx, _) in sorted_gpu_tokens:
+        #     with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
+        #         self.comm_out_events[gpu_idx].wait()
+        #         outputs[gpu_idx] = outputs_to_send[gpu_idx].to(next_states.device, non_blocking=True)
+        #         self.end_events[gpu_idx].record()
+
+
+        # for (gpu_idx,_) in sorted_gpu_tokens:
+        #     self.start_events[gpu_idx].record()
+
+        #     with torch.cuda.stream(self.comm_in_stream):             
+        #         _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+        #         self.comm_in_events[gpu_idx].record()
+            
+        #     with torch.cuda.stream(self.comp_streams[gpu_idx]):
+        #         self.comm_in_events[gpu_idx].wait()
+        #         if gpu_idx != self.num_gpus-1:
+        #             _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+        #         else:
+        #             _output = self.offload.forward(_input, idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
+        #         self.comm_out_events[gpu_idx].record()
+            
+        #     with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
+        #         self.comm_out_events[gpu_idx].wait()
+        #         outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
+            
+        #     self.end_events[gpu_idx].record()
+
+        # 21
+        # for (gpu_idx,_) in sorted_gpu_tokens:
+        #     self.start_events[gpu_idx].record()
+        #     _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+        #     if gpu_idx != self.num_gpus-1:
+        #         _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+        #     else:
+        #         _output = self.offload.forward(_input, idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
+        #     outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
+        #     self.end_events[gpu_idx].record()         
+        # torch.cuda.synchronize()
+
+        # 22
+        # for (gpu_idx,_) in sorted_gpu_tokens:
+        #     self.start_events[gpu_idx].record()
+
+        #     with torch.cuda.stream(self.comm_in_stream):
+        #         _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+        #         self.comm_in_events[gpu_idx].record()
+            
+        #     self.comm_in_events[gpu_idx].wait()
+        #     if gpu_idx != self.num_gpus-1:
+        #         _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+        #     else:
+        #         _output = self.offload.forward(_input, idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
+        #     outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
+        #     self.end_events[gpu_idx].record()         
+        # torch.cuda.synchronize()
+
+        # 23
+        # for (gpu_idx,_) in sorted_gpu_tokens:
+        #     self.start_events[gpu_idx].record()
+
+        #     with torch.cuda.stream(self.comm_in_stream):
+        #         _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+        #         self.comm_in_events[gpu_idx].record()
+            
+        #     with torch.cuda.stream(self.comp_streams[gpu_idx]):
+        #         self.comm_in_events[gpu_idx].wait()
+        #         if gpu_idx != self.num_gpus-1:
+        #             _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+        #         else:
+        #             _output = self.offload.forward(_input, idxs=offload_experts_idx)
+        #         outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
+
+        #     self.end_events[gpu_idx].record()         
+        # torch.cuda.synchronize()
+
+
+        # 24
+        def send_input(gpu_idx):
+            def callback(future):
+                with torch.cuda.stream(self.comm_in_stream):
+                    _input = future.value().to(f"cuda:{gpu_idx}", non_blocking=True)
+                    self.comm_in_events[gpu_idx].record()
+                    return _input
+            return callback 
+        
+        def perform_computation(gpu_idx):
+            def callback(future):
+                with torch.cuda.stream(self.comp_streams[gpu_idx]):
+                    self.comm_in_events[gpu_idx].wait()
+                    _input = future.value()
+                    if gpu_idx != self.num_gpus-1:
+                        _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+                    else:
+                        _output = self.offload.forward(_input, idxs=offload_experts_idx)
+                    self.comp_events[gpu_idx].record()
+                    return _output
+            return callback
+
+        def send_output(gpu_idx):
+            def callback(future):
+                with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
+                    self.comp_events[gpu_idx].wait()
+                    output = future.value()
+                    outputs[gpu_idx] = output.to(next_states.device, non_blocking=True)
+            return callback
+
+        futures = []
+        for (gpu_idx,_) in sorted_gpu_tokens:
             self.start_events[gpu_idx].record()
 
-            with torch.cuda.stream(self.comm_in_stream):
-                _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
-                self.comm_in_events[gpu_idx].record()
+            future = torch.futures.Future()
+            future.set_result(inputs_to_send[gpu_idx])
             
-            with torch.cuda.stream(self.comp_streams[gpu_idx]):
-                self.comm_in_events[gpu_idx].wait()
-                if gpu_idx != self.num_gpus-1:
-                    _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
-                else:
-                    _output = self.offload.forward(_input, idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
-                self.comp_events[gpu_idx].record()
-            
-            with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
-                self.comp_events[gpu_idx].wait()
-                outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
-                
-            self.end_events[gpu_idx].record()
+            future = future.then(send_input(gpu_idx))
+            future = future.then(perform_computation(gpu_idx))
+            future = future.then(send_output(gpu_idx))
 
-        torch.cuda.synchronize()
+            futures.append(future)   
+
+            self.end_events[gpu_idx].record()    
+
+        for future in futures:
+            torch.jit._wait(future)
+
+        # for (gpu_idx, _) in sorted_gpu_tokens:
+        #     with torch.cuda.stream(self.comm_in_stream):             
+        #          _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+        #         self.comm_in_events[gpu_idx].record()
+            
+        #     with torch.cuda.stream(self.comp_streams[gpu_idx]):
+        #         self.comm_in_events[gpu_idx].wait()
+        #         if gpu_idx != self.num_gpus-1:
+        #         _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+        #     else:
+        #         _output = self.offload.forward(_input, idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
+        #         self.comm_out_events[gpu_idx].record()
+            
+        #     with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
+        #         self.comm_out_events[gpu_idx].wait()
+        #         outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
+            
+        #     self.end_events[gpu_idx].record()
+
+        # Figure out how to get parallelism here? many streams?
+
+
+            # with torch.cuda.stream(self.comm_in_stream):
+            #     _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+            #     self.comm_in_events[gpu_idx].record()
+            
+            # with torch.cuda.stream(self.comp_streams[gpu_idx]):
+            #     self.comm_in_events[gpu_idx].wait()
+                # if gpu_idx != self.num_gpus-1:
+                #     _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+                # else:
+                #     _output = self.offload.forward(_input, idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
+            #     self.comp_events[gpu_idx].record()
+            
+            # with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
+            #     self.comp_events[gpu_idx].wait()
+            #     outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
+                
+            # self.end_events[gpu_idx].record()
         
         for gpu_idx in range(self.num_gpus):
             if gpu_idx != self.num_gpus-1:
