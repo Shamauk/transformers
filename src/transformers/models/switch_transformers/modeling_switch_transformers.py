@@ -48,7 +48,7 @@ import threading
 from queue import Queue
 
 import torch.multiprocessing as mp
-import stk
+# import stk
 
 logger = logging.get_logger(__name__)
 
@@ -302,35 +302,6 @@ class SwitchTransformersDenseActDenseFused(nn.Module):
 
         return hidden_states
 
-class SwitchTransformersDenseActDenseFusedSparse(nn.Module):
-    def __init__(self, config: SwitchTransformersConfig, num_experts):
-        super().__init__()
-        self.dropout = nn.Dropout(config.dropout_rate)
-        self.act = ACT2FN[config.dense_act_fn]
-
-        inner_dim = config.d_ff * num_experts
-        self.wis = nn.Parameter(torch.empty(config.d_model, inner_dim))
-        self.wos = nn.Parameter(torch.empty(inner_dim, config.d_model))
-
-        self.experts = []
-    
-    def forward(self, hidden_states, topo, idxs=None):
-        if idxs is None:
-            hidden_states = stk.ops.sdd(hidden_states, self.wis, topo)
-        else:
-            hidden_states = stk.ops.sdd(hidden_states, self.wis[idxs, :, :], topo)
-        
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-
-        if idxs is None:
-            hidden_states = stk.ops.dsd(hidden_states, self.wos)
-        else:
-            hidden_states = stk.ops.dsd(hidden_states, self.wos)
-        
-        return hidden_states
-
-
 class SwitchTransformersSparseMLP(nn.Module):
     r"""
     Implementation of the Switch Transformers Sparse MLP module.
@@ -344,7 +315,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.num_gpus = config.num_gpus
         self.config = config
 
-        # self.streams = [torch.cuda.Stream(device=f'cuda:{i}') for i in range(self.num_gpus)]
         self.start_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_gpus)]
         self.end_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_gpus)]
         self.latencies = [[] for i in range(self.num_gpus)]
@@ -366,13 +336,24 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         self.gpu_experts = nn.ModuleDict()
 
+        self.comm_in_stream = torch.cuda.Stream(device="cuda:0")
+        self.comm_out_streams = [torch.cuda.Stream(device=f"cuda:{i}") for i in range(self.num_gpus)]
+        self.comp_streams = [torch.cuda.Stream(device=f"cuda:{i}") for i in range(self.num_gpus)]
+        self.recombine_stream = torch.cuda.Stream(device="cuda:0")
+
+        self.comm_in_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_gpus)]
+        self.comm_out_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_gpus)]
+        self.comp_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_gpus)]
+        self.start_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_gpus)]
+        self.end_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_gpus)]
+
     # Assumption that the offload GPU will be the last one
     def expert_parallelise(self):
         # Create the offload on the final GPU
-        self.offload = SwitchTransformersDenseActDenseFusedSparse(self.config, self.num_experts)
-        wis_tensor = torch.cat([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in range(self.num_experts)], dim=1)
+        self.offload = SwitchTransformersDenseActDenseFused(self.config, self.num_experts)
+        wis_tensor = torch.stack([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in range(self.num_experts)], dim=0)
         self.offload.wis.data.copy_(wis_tensor)
-        wos_tensor = torch.cat([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in range(self.num_experts)], dim=0)
+        wos_tensor = torch.stack([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in range(self.num_experts)], dim=0)
         self.offload.wos.data.copy_(wos_tensor)
         self.offload.experts = range(self.num_experts)
         self.offload = self.offload.to(f"cuda:{self.num_gpus-1}")
@@ -388,12 +369,12 @@ class SwitchTransformersSparseMLP(nn.Module):
                 num_to_allocate += 1
                 extras_to_allocate -= 1
 
-            self.gpu_experts[f"gpu_{gpu_idx}"] = SwitchTransformersDenseActDenseFusedSparse(self.config, num_to_allocate)
+            self.gpu_experts[f"gpu_{gpu_idx}"] = SwitchTransformersDenseActDenseFused(self.config, num_to_allocate)
 
             experts = range(cur_expert, cur_expert+num_to_allocate)
-            wis_tensor = torch.cat([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in experts], dim=1)
+            wis_tensor = torch.stack([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in experts], dim=0)
             self.gpu_experts[f"gpu_{gpu_idx}"].wis.data.copy_(wis_tensor)
-            wos_tensor = torch.cat([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in experts], dim=0)
+            wos_tensor = torch.stack([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in experts], dim=0)
             self.gpu_experts[f"gpu_{gpu_idx}"].wos.data.copy_(wos_tensor)
             self.gpu_experts[f"gpu_{gpu_idx}"].experts = experts
             self.gpu_idx_and_offset_to_expert[gpu_idx] = experts
@@ -403,8 +384,6 @@ class SwitchTransformersSparseMLP(nn.Module):
 
             self.gpu_experts[f"gpu_{gpu_idx}"] = self.gpu_experts[f"gpu_{gpu_idx}"].to(f"cuda:{gpu_idx}")
         
-        print("Finished loading weights on sparse matrix")
-
     def expert_save_latencies(self, DIR=""):
         with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
             fieldnames = ["total number of tokens", "iteration", "expert_0 num tokens", "expert_1 num tokens", "expert_2 num tokens", 
@@ -434,247 +413,638 @@ class SwitchTransformersSparseMLP(nn.Module):
 
                 writer.writerow(dic)
 
-    def process_tokens_on_gpu(self, gpu_idx, hidden_states, router_mask, next_states, queue, expert_to_offload, max_tokens_to_a_single_expert, num_tokens_to_rebalance):
-        torch.cuda.set_device(gpu_idx)
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        start_event.record()
-
-        x = []
-        for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
-            expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
-            data = hidden_states[router_mask[:, :, expert_idx]].to(f"cuda:{gpu_idx}", non_blocking=True)
-            if expert_idx == expert_to_offload and num_tokens_to_rebalance > 0:
-                data = data[:-num_tokens_to_rebalance, :]
-            x.append(data)
-        
-        tokens = torch.cat(x, axis=0)
-        shape = (tokens.shape[0], self.config.d_ff * len(self.gpu_idx_and_offset_to_expert[gpu_idx]))
-        # Not used (so reserved in meta)
-        data = torch.empty(
-            400,
-            128,
-            128,
-            device="meta"
-        )
-        topo = stk.Matrix(shape, data, )
-        print(tokens.shape)
-        response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens, topo).to("cuda:0", non_blocking=True)
-        print(response.shape)
-        exit(1)
-
-        # (num_toks, d_model)
-        # x = hidden_states[router_mask[:, :, self.gpu_idx_and_offset_to_expert[gpu_idx]]].to(f"cuda:{gpu_idx}", non_blocking=True)
-        # print(x.shape)
-        # exit(1)
-        # if expert_to_offload in self.gpu_idx_and_offset_to_expert[gpu_idx]:
-        #     i = self.gpu_idx_and_offset_to_expert[gpu_idx].index(expert_to_offload)
-
-
-        # stack = []
-        # largest = max_tokens_to_a_single_expert
-        # sizes = []
-        # for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
-        #     expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
-        #     data = hidden_states[router_mask[:, :, expert_idx]].to(f"cuda:{gpu_idx}", non_blocking=True)
-        #     if expert_idx == expert_to_offload and num_tokens_to_rebalance > 0:
-        #         data = data[:-num_tokens_to_rebalance, :]
-        #         pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{gpu_idx}", non_blocking=True)
-        #         stack.append(torch.cat((data, pad), dim=0))
-        #         sizes.append(data.shape[0])
-        #     else:
-        #         pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{gpu_idx}", non_blocking=True)
-        #         stack.append(torch.cat((data, pad), dim=0))
-        #         sizes.append(data.shape[0])
-
-
-        # tokens = torch.stack(stack)
-        # response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens).to("cuda:0", non_blocking=True)
-
-        end_event.record()
-        torch.cuda.synchronize(gpu_idx)
-        elapsed_time = start_event.elapsed_time(end_event)
-
-        if num_tokens_to_rebalance > 0:
-            inclusion_experts = self.gpu_idx_and_offset_to_expert[gpu_idx][:]
-            inclusion_idx = list(range(len(inclusion_experts)))
-            idx_of_offload = inclusion_experts.index(expert_to_offload)
-            inclusion_experts.pop(idx_of_offload)
-            inclusion_idx.pop(idx_of_offload)
-            size_offload = sizes[idx_of_offload]
-            sizes.pop(idx_of_offload)
-
-            queue.put({
-                "latency": elapsed_time,
-                "mask": router_mask[:, :, inclusion_experts],
-                "states": response[inclusion_idx, :, :],
-                "sizes": sizes,
-                "mask-offload": router_mask[:, :, expert_to_offload],
-                "states-offload": response[idx_of_offload, :size_offload, :],
-                "size-offload": size_offload
-            })
-        else:
-            queue.put({
-                "latency": elapsed_time,
-                "mask": router_mask[:, :, self.gpu_idx_and_offset_to_expert[gpu_idx]],
-                "states": response,
-                "sizes": sizes,
-            })
-
-
-    def process_offload_gpu(self, gpu_idx, offloaded, largest, hidden_states, router_mask, next_states, queue):
-        return
-        torch.cuda.set_device(gpu_idx)
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        start_event.record()
-
+    def pad_input(self, inputs, largest):
         stack = []
-        idxs = []
-        for idx in range(self.num_experts):
-            if offloaded[idx] > 0:
-                data = hidden_states[router_mask[:, :, idx]][-offloaded[idx]:,:].to(f"cuda:{self.num_gpus-1}", non_blocking=True)
-                pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{self.num_gpus-1}", non_blocking=True)
-                stack.append(torch.cat((data, pad), dim=0))
-                idxs.append(idx)
+        pads = []
+        for _input in inputs:
+            pad = torch.zeros((largest-_input.shape[0],_input.shape[1])).to(_input.device, non_blocking=True)
+            stack.append(torch.cat((_input, pad), dim=0))
+            pads.append(pad.shape[0])
+        return torch.stack(stack), pads
 
-        tokens = torch.stack(stack)
-        response = self.offload(tokens, idxs=idxs).to("cuda:0", non_blocking=True)
-
-        end_event.record()
-        torch.cuda.synchronize(gpu_idx)
-        elapsed_time = start_event.elapsed_time(end_event)
-        queue.put({
-            "latency": elapsed_time,
-            'mask': [router_mask[:, :, idx] for idx in idxs],
-            'states': response,
-            'offloaded': [offloaded[idx] for idx in idxs]
-        })
-
-
+    @torch.no_grad()
     def forward(self, hidden_states):
-        r"""
-        Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
-
-        1- Gets the `router_mask` from the router. The shape of the mask is `(batch_size, sequence_length, num_expert)`
-        and corresponds to the argmax of the `router_probs`. The probabilities are needed in the computation of the
-        hidden states : they are broadcasted to the hidden states values (can be interpreted as a scaling factor).
-
-        2- Dispatch the tokens to its associated experts. We do a classic for loop over the experts and assign for each
-        expert the corresponding hidden states.
-
-        """
-
-        # Step 1: Get the router_mask from the router as wel as the probabilities
         router_mask, router_probs, router_logits = self.router(hidden_states)
         expert_index = torch.argmax(router_mask, dim=-1)
-
-        # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
-        # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
-
         next_states = hidden_states.clone()
-
         router_mask = router_mask.bool()
+        
         batch_size, seq_len, num_experts = router_mask.shape
-        idx_mask = router_mask.transpose(1, 2).reshape(batch_size * seq_len, num_experts).sum(dim=0)
-        idx_mask = torch.nonzero(idx_mask, as_tuple=True)[
-            0
-        ].tolist()  # length: number of "activated" expert / value: index
-        if self.num_gpus == 0:
-            for idx in idx_mask:
-                next_states[router_mask[:, :, idx]] = self.experts[f"expert_{idx}"].forward(
-                    hidden_states[router_mask[:, :, idx]])
-        else:
-            num_toks = hidden_states.shape[0] * hidden_states.shape[1]
-            avg_num_toks = num_toks // self.num_gpus
-            self.tot_num_tokens.append(num_toks)
+        outputs = [None for _ in range(self.num_gpus)]
+        masks = [router_mask[:, :, i] for i in range(self.num_experts)]
+        inputs_to_send = [None for _ in range(self.num_gpus)]
+        paddings = [None for _ in range(self.num_gpus)]
 
-            ######### BREAD AND BUTTER #############
-            # Calculate amount to be offloaded
-            offloaded = [0 for _ in range(self.num_experts)]
-            expert_to_offload_list = [0 for _ in range(self.num_gpus-1)]
-            max_tokens_to_a_single_expert_list = [0 for _ in range(self.num_gpus-1)]
-            num_tokens_to_rebalance_list = [0 for _ in range(self.num_gpus-1)]
+        num_toks = hidden_states.shape[0]*hidden_states.shape[1]
+        avg_num_toks = num_toks / self.num_gpus 
+        self.tot_num_tokens.append(num_toks)
 
-            for gpu_idx in range(self.num_gpus-1):
-                num_tokens_for_gpu = 0
-                max_index = -1
-                max_tokens_to_a_single_expert = 0
-                second_largest_num_tokens_to_a_single_expert = 0
-                for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
-                    expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
-                    num_tokens = hidden_states[router_mask[:, :, expert_idx]].shape[0]
-                    self.num_token_each_expert[expert_idx].append(num_tokens)
-                    num_tokens_for_gpu += num_tokens
-                    if num_tokens > max_tokens_to_a_single_expert:
-                        second_largest_num_tokens_to_a_single_expert = max_tokens_to_a_single_expert
-                        max_tokens_to_a_single_expert = num_tokens
-                        max_index = expert_idx
-                    elif num_tokens > second_largest_num_tokens_to_a_single_expert:
-                        second_largest_num_tokens_to_a_single_expert = num_tokens
+        # Calculate amount to be offloaded
+        offloaded = [0 for _ in range(self.num_experts)]
 
-                # Then rebalance 
-                ## Get number of tokens to rebalance
-                num_tokens_to_rebalance = num_tokens_for_gpu - int(avg_num_toks * 1.15)
-                num_tokens_to_rebalance = max(0, num_tokens_to_rebalance)
-                self.num_token_each_gpu[gpu_idx].append(num_tokens_for_gpu - num_tokens_to_rebalance)
-                if num_tokens_to_rebalance > 0:
-                    # We will rebalance the tokens from the expert with the most
-                    offloaded[max_index] = num_tokens_to_rebalance
-                expert_to_offload_list[gpu_idx] = max_index
-                max_tokens_to_a_single_expert_list[gpu_idx] = max(max_tokens_to_a_single_expert - num_tokens_to_rebalance, second_largest_num_tokens_to_a_single_expert)
-                num_tokens_to_rebalance_list[gpu_idx] = num_tokens_to_rebalance
+        for gpu_idx in range(self.num_gpus-1):
+            num_tokens_for_gpu = 0
+            max_index = -1
+            max_tokens_to_a_single_expert = 0
+            second_largest_num_tokens_to_a_single_expert = 0
+            for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
+                expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
+                num_tokens = hidden_states[router_mask[:, :, expert_idx]].shape[0]
+                self.num_token_each_expert[expert_idx].append(num_tokens)
+                num_tokens_for_gpu += num_tokens
+                if num_tokens > max_tokens_to_a_single_expert:
+                    second_largest_num_tokens_to_a_single_expert = max_tokens_to_a_single_expert
+                    max_tokens_to_a_single_expert = num_tokens
+                    max_index = expert_idx
+                elif num_tokens > second_largest_num_tokens_to_a_single_expert:
+                    second_largest_num_tokens_to_a_single_expert = num_tokens
+
+            # Then rebalance 
+            ## Get number of tokens to rebalance
+            num_tokens_to_rebalance = num_tokens_for_gpu - int(avg_num_toks * 1.15)
+            num_tokens_to_rebalance = max(0, num_tokens_to_rebalance)
+            self.num_token_each_gpu[gpu_idx].append(num_tokens_for_gpu - num_tokens_to_rebalance)
+            if num_tokens_to_rebalance > 0:
+                # We will rebalance the tokens from the expert with the most
+                offloaded[max_index] = num_tokens_to_rebalance
             
-            self.num_token_each_gpu[self.num_gpus-1].append(sum(offloaded))
-            largest_offloaded_amt = max(offloaded)
+            # need to group the inputs and send to self.pad_input
+            stack = []
+            for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
+                expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
+                if expert_idx == max_index and num_tokens_to_rebalance > 0:
+                    stack.append(hidden_states[router_mask[:, :, expert_idx]][:-num_tokens_to_rebalance])
+                else:
+                    stack.append(hidden_states[router_mask[:, :, expert_idx]])
+
+            _in, _p = self.pad_input(stack, 
+                max(max_tokens_to_a_single_expert - num_tokens_to_rebalance, 
+                    second_largest_num_tokens_to_a_single_expert))
+            
+            inputs_to_send[gpu_idx] = _in
+            paddings[gpu_idx] = _p
+
+
+        # Dealing with the offloaded 
+        self.num_token_each_gpu[self.num_gpus-1].append(sum(offloaded))
+        largest_offloaded_amt = max(offloaded)
+        _in, _p = self.pad_input([hidden_states[masks[i]][-offloaded[i]:] for i in range(self.num_experts) if offloaded[i] > 0], largest_offloaded_amt)
+        inputs_to_send[-1] = _in
+        paddings[-1] = _p
+       
+
+        for gpu_idx in range(self.num_gpus):
+            self.start_events[gpu_idx].record()
+
+            with torch.cuda.stream(self.comm_in_stream):
+                _input = inputs_to_send[gpu_idx].to(f"cuda:{gpu_idx}", non_blocking=True)
+                self.comm_in_events[gpu_idx].record()
+            
+            with torch.cuda.stream(self.comp_streams[gpu_idx]):
+                self.comm_in_events[gpu_idx].wait()
+                if gpu_idx != self.num_gpus-1:
+                    _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
+                else:
+                    _output = self.offload.forward(_input, idxs=[i for i in range(self.num_experts) if offloaded[i] > 0])
+                self.comp_events[gpu_idx].record()
+            
+            with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
+                self.comp_events[gpu_idx].wait()
+                outputs[gpu_idx] = _output.to(next_states.device, non_blocking=True)
+                
+            self.end_events[gpu_idx].record()
+
+        torch.cuda.synchronize()
+        
+        for gpu_idx in range(self.num_gpus):
+            if gpu_idx != self.num_gpus-1:
+                for i in range(outputs[gpu_idx].shape[0]):
+                    expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
+                    if offloaded[expert_idx] == 0:
+                        if paddings[gpu_idx][i] == 0:
+                            next_states[masks[expert_idx]] = outputs[gpu_idx][i]
+                        else:
+                            next_states[masks[expert_idx]] = outputs[gpu_idx][i][:-paddings[gpu_idx][i]]
+                    else:
+                        if paddings[gpu_idx][i] == 0:
+                            next_states[masks[expert_idx]][:-offloaded[expert_idx]] = outputs[gpu_idx][i]
+                        else:
+                            next_states[masks[expert_idx]][:-offloaded[expert_idx]] = outputs[gpu_idx][i][:-paddings[gpu_idx][i]]
+            else:
+                cur = 0 
+                for idx, amt in enumerate(offloaded):
+                    if amt > 0:
+                        if paddings[-1][cur] == 0:
+                            next_states[masks[idx]][-amt:] = outputs[gpu_idx][cur]
+                        else:
+                            next_states[masks[idx]][-amt:] = outputs[gpu_idx][cur][:-paddings[-1][cur]]
+                        cur += 1
+
+        for gpu_idx in range(self.num_gpus):
+            self.latencies[gpu_idx].append(self.start_events[gpu_idx]
+                .elapsed_time(self.end_events[gpu_idx]))
+        
+        hidden_states = router_probs * next_states
+        return hidden_states, (router_logits, expert_index)
+
+
+
+    # def forward(self, hidden_states):
+
+    #     r"""
+    #     Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
+
+    #     1- Gets the `router_mask` from the router. The shape of the mask is `(batch_size, sequence_length, num_expert)`
+    #     and corresponds to the argmax of the `router_probs`. The probabilities are needed in the computation of the
+    #     hidden states : they are broadcasted to the hidden states values (can be interpreted as a scaling factor).
+
+    #     2- Dispatch the tokens to its associated experts. We do a classic for loop over the experts and assign for each
+    #     expert the corresponding hidden states.
+
+    #     """
+
+    #     # Step 1: Get the router_mask from the router as wel as the probabilities
+    #     router_mask, router_probs, router_logits = self.router(hidden_states)
+    #     expert_index = torch.argmax(router_mask, dim=-1)
+
+    #     # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
+    #     # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
+
+    #     next_states = hidden_states.clone()
+
+    #     router_mask = router_mask.bool()
+    #     batch_size, seq_len, num_experts = router_mask.shape
+    #     idx_mask = router_mask.transpose(1, 2).reshape(batch_size * seq_len, num_experts).sum(dim=0)
+    #     idx_mask = torch.nonzero(idx_mask, as_tuple=True)[
+    #         0
+    #     ].tolist()  # length: number of "activated" expert / value: index
+    #     if self.num_gpus == 0:
+    #         for idx in idx_mask:
+    #             next_states[router_mask[:, :, idx]] = self.experts[f"expert_{idx}"].forward(
+    #                 hidden_states[router_mask[:, :, idx]])
+    #     else:
+    #         num_toks = hidden_states.shape[0] * hidden_states.shape[1]
+    #         avg_num_toks = num_toks // self.num_gpus
+    #         self.tot_num_tokens.append(num_toks)
+
+    #         ######### BREAD AND BUTTER #############
+    #         # # Calculate amount to be offloaded
+    #         # offloaded = [0 for _ in range(self.num_experts)]
+    #         # expert_to_offload_list = [0 for _ in range(self.num_gpus-1)]
+    #         # max_tokens_to_a_single_expert_list = [0 for _ in range(self.num_gpus-1)]
+    #         # num_tokens_to_rebalance_list = [0 for _ in range(self.num_gpus-1)]
+
+    #         # for gpu_idx in range(self.num_gpus-1):
+    #         #     num_tokens_for_gpu = 0
+    #         #     max_index = -1
+    #         #     max_tokens_to_a_single_expert = 0
+    #         #     second_largest_num_tokens_to_a_single_expert = 0
+    #         #     for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
+    #         #         expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
+    #         #         num_tokens = hidden_states[router_mask[:, :, expert_idx]].shape[0]
+    #         #         self.num_token_each_expert[expert_idx].append(num_tokens)
+    #         #         num_tokens_for_gpu += num_tokens
+    #         #         if num_tokens > max_tokens_to_a_single_expert:
+    #         #             second_largest_num_tokens_to_a_single_expert = max_tokens_to_a_single_expert
+    #         #             max_tokens_to_a_single_expert = num_tokens
+    #         #             max_index = expert_idx
+    #         #         elif num_tokens > second_largest_num_tokens_to_a_single_expert:
+    #         #             second_largest_num_tokens_to_a_single_expert = num_tokens
+
+    #         #     # Then rebalance 
+    #         #     ## Get number of tokens to rebalance
+    #         #     num_tokens_to_rebalance = num_tokens_for_gpu - int(avg_num_toks * 1.15)
+    #         #     num_tokens_to_rebalance = max(0, num_tokens_to_rebalance)
+    #         #     self.num_token_each_gpu[gpu_idx].append(num_tokens_for_gpu - num_tokens_to_rebalance)
+    #         #     if num_tokens_to_rebalance > 0:
+    #         #         # We will rebalance the tokens from the expert with the most
+    #         #         offloaded[max_index] = num_tokens_to_rebalance
+    #         #     expert_to_offload_list[gpu_idx] = max_index
+    #         #     max_tokens_to_a_single_expert_list[gpu_idx] = max(max_tokens_to_a_single_expert - num_tokens_to_rebalance, second_largest_num_tokens_to_a_single_expert)
+    #         #     num_tokens_to_rebalance_list[gpu_idx] = num_tokens_to_rebalance
+            
+    #         # self.num_token_each_gpu[self.num_gpus-1].append(sum(offloaded))
+    #         # largest_offloaded_amt = max(offloaded)
            
-            threads = []
-            queues = [Queue() for _ in range(self.num_gpus)]
-            for gpu_idx in range(self.num_gpus):
-                if gpu_idx == self.num_gpus - 1:
-                    thread = threading.Thread(target=self.process_offload_gpu, args=(
-                        gpu_idx,
-                        offloaded, 
-                        largest_offloaded_amt,
-                        hidden_states,
-                        router_mask, next_states, queues[gpu_idx]
-                    ))
-                else:
-                    thread = threading.Thread(target=self.process_tokens_on_gpu, args=(
-                        gpu_idx,
-                        hidden_states,
-                        router_mask,
-                        next_states,
-                        queues[gpu_idx],
-                        expert_to_offload_list[gpu_idx], 
-                        max_tokens_to_a_single_expert_list[gpu_idx],
-                        num_tokens_to_rebalance_list[gpu_idx]
-                    ))
-                thread.start()
-                threads.append(thread)
+    #         threads = []
+    #         queues = [Queue() for _ in range(self.num_gpus)]
+    #         for gpu_idx in range(self.num_gpus):
+    #             if gpu_idx == self.num_gpus - 1:
+    #                 thread = threading.Thread(target=self.process_offload_gpu, args=(
+    #                     gpu_idx,
+    #                     offloaded, 
+    #                     largest_offloaded_amt,
+    #                     hidden_states,
+    #                     router_mask, next_states, queues[gpu_idx]
+    #                 ))
+    #             else:
+    #                 thread = threading.Thread(target=self.process_tokens_on_gpu, args=(
+    #                     gpu_idx,
+    #                     hidden_states,
+    #                     router_mask,
+    #                     next_states,
+    #                     queues[gpu_idx],
+    #                     expert_to_offload_list[gpu_idx], 
+    #                     max_tokens_to_a_single_expert_list[gpu_idx],
+    #                     num_tokens_to_rebalance_list[gpu_idx]
+    #                 ))
+    #             thread.start()
+    #             threads.append(thread)
 
-            for gpu_idx in range(self.num_gpus):
-                result = queues[gpu_idx].get()
-                self.latencies[gpu_idx].append(result['latency'])
-                if "offloaded" in result:
-                    for idx, offload in enumerate(result["offloaded"]):
-                        next_states[result["mask"][idx]][-offload:, :] = result["states"][idx, :offload, :]
-                else:
-                    for idx, size in enumerate(result["sizes"]):
-                        next_states[result["mask"][:, :, idx]] = result["states"][idx, :size, :]
-                    if "mask-offload" in result:
-                        next_states[result["mask-offload"]][:result["size-offload"], :] = result["states-offload"]
+    #         for gpu_idx in range(self.num_gpus):
+    #             result = queues[gpu_idx].get()
+    #             self.latencies[gpu_idx].append(result['latency'])
+    #             if "offloaded" in result:
+    #                 for idx, offload in enumerate(result["offloaded"]):
+    #                     next_states[result["mask"][idx]][-offload:, :] = result["states"][idx, :offload, :]
+    #             else:
+    #                 for idx, size in enumerate(result["sizes"]):
+    #                     next_states[result["mask"][:, :, idx]] = result["states"][idx, :size, :]
+    #                 if "mask-offload" in result:
+    #                     next_states[result["mask-offload"]][:result["size-offload"], :] = result["states-offload"]
 
-            for thread in threads:
-                thread.join()
+    #         for thread in threads:
+    #             thread.join()
 
            
                 
-        torch.cuda.synchronize()
-        hidden_states = router_probs * next_states
-        return hidden_states, (router_logits, expert_index)
+    #     torch.cuda.synchronize()
+    #     hidden_states = router_probs * next_states
+    #     return hidden_states, (router_logits, expert_index)
+
+class SwitchTransformersDenseActDenseFusedSparse(nn.Module):
+    def __init__(self, config: SwitchTransformersConfig, num_experts):
+        super().__init__()
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.act = ACT2FN[config.dense_act_fn]
+
+        inner_dim = config.d_ff * num_experts
+        self.wis = nn.Parameter(torch.empty(config.d_model, inner_dim))
+        self.wos = nn.Parameter(torch.empty(inner_dim, config.d_model))
+
+        self.experts = []
+    
+    def forward(self, hidden_states, topo, idxs=None):
+        if idxs is None:
+            hidden_states = stk.ops.sdd(hidden_states, self.wis, topo)
+        else:
+            hidden_states = stk.ops.sdd(hidden_states, self.wis[idxs, :, :], topo)
+        
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+
+        if idxs is None:
+            hidden_states = stk.ops.dsd(hidden_states, self.wos)
+        else:
+            hidden_states = stk.ops.dsd(hidden_states, self.wos)
+        
+        return hidden_states
+
+
+# class SwitchTransformersSparseMLP(nn.Module):
+#     r"""
+#     Implementation of the Switch Transformers Sparse MLP module.
+#     """
+
+#     def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None):
+#         super().__init__()
+#         self.layer_idx = layer_idx
+
+#         self.num_experts = config.num_experts
+#         self.num_gpus = config.num_gpus
+#         self.config = config
+
+#         # self.streams = [torch.cuda.Stream(device=f'cuda:{i}') for i in range(self.num_gpus)]
+#         self.start_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_gpus)]
+#         self.end_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_gpus)]
+#         self.latencies = [[] for i in range(self.num_gpus)]
+#         self.tot_num_tokens = []
+#         self.num_token_each_expert = [[] for _ in range(self.num_experts)]
+#         self.num_token_each_gpu = [[] for _ in range(self.num_gpus)]
+
+#         self.expert_to_gpu_idx = [-1 for _ in range(self.num_experts)]
+#         self.gpu_idx_and_offset_to_expert = [[] for _ in range(self.num_gpus)]
+#         self.gpu_idx_and_offset_to_expert[self.num_gpus-1] = list(range(self.num_experts))
+
+#         # Step 1: Get the correct router according to its class
+#         self.router = SwitchTransformersTop1Router(config)
+
+#         # Step 2: Get the experts
+#         self.experts = nn.ModuleDict()
+#         for idx in range(self.num_experts):
+#             self.experts[f"expert_{idx}"] = expert_class(config, expert_idx=idx, layer_idx=layer_idx)
+
+#         self.gpu_experts = nn.ModuleDict()
+
+#     # Assumption that the offload GPU will be the last one
+#     def expert_parallelise(self):
+#         # Create the offload on the final GPU
+#         self.offload = SwitchTransformersDenseActDenseFusedSparse(self.config, self.num_experts)
+#         wis_tensor = torch.cat([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in range(self.num_experts)], dim=1)
+#         self.offload.wis.data.copy_(wis_tensor)
+#         wos_tensor = torch.cat([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in range(self.num_experts)], dim=0)
+#         self.offload.wos.data.copy_(wos_tensor)
+#         self.offload.experts = range(self.num_experts)
+#         self.offload = self.offload.to(f"cuda:{self.num_gpus-1}")
+
+#         # Still a naive collocation on the rest
+#         extras_to_allocate = self.num_experts % (self.num_gpus - 1)
+#         num_experts_per_gpu = self.num_experts // (self.num_gpus - 1)
+
+#         cur_expert = 0
+#         for gpu_idx in range(self.num_gpus-1):
+#             num_to_allocate = num_experts_per_gpu
+#             if extras_to_allocate > 0:
+#                 num_to_allocate += 1
+#                 extras_to_allocate -= 1
+
+#             self.gpu_experts[f"gpu_{gpu_idx}"] = SwitchTransformersDenseActDenseFusedSparse(self.config, num_to_allocate)
+
+#             experts = range(cur_expert, cur_expert+num_to_allocate)
+#             wis_tensor = torch.cat([self.experts[f"expert_{idx}"].wi.weight.transpose(0,1) for idx in experts], dim=1)
+#             self.gpu_experts[f"gpu_{gpu_idx}"].wis.data.copy_(wis_tensor)
+#             wos_tensor = torch.cat([self.experts[f"expert_{idx}"].wo.weight.transpose(0,1) for idx in experts], dim=0)
+#             self.gpu_experts[f"gpu_{gpu_idx}"].wos.data.copy_(wos_tensor)
+#             self.gpu_experts[f"gpu_{gpu_idx}"].experts = experts
+#             self.gpu_idx_and_offset_to_expert[gpu_idx] = experts
+#             for e_idx in experts:
+#                self.expert_to_gpu_idx[e_idx] = gpu_idx
+#             cur_expert += num_to_allocate
+
+#             self.gpu_experts[f"gpu_{gpu_idx}"] = self.gpu_experts[f"gpu_{gpu_idx}"].to(f"cuda:{gpu_idx}")
+        
+#         print("Finished loading weights on sparse matrix")
+
+#     def expert_save_latencies(self, DIR=""):
+#         with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
+#             fieldnames = ["total number of tokens", "iteration", "expert_0 num tokens", "expert_1 num tokens", "expert_2 num tokens", 
+#             "expert_3 num tokens", "expert_4 num tokens", "expert_5 num tokens", "expert_6 num tokens", "expert_7 num tokens", 
+#             "gpu:0 num tokens", "gpu:1 num tokens", "gpu:2 num tokens", "gpu:3 num tokens", 
+#             "gpu:0 latency (ms)", "gpu:1 latency (ms)", "gpu:2 latency (ms)", "gpu:3 latency (ms)"]
+#             writer = csv.DictWriter(f, fieldnames=fieldnames)
+#             writer.writeheader()
+#             start_idx_of_cur = 0
+#             cur_tot_toks = 0
+#             for i in range(len(self.tot_num_tokens)):
+#                 if self.tot_num_tokens[i] != cur_tot_toks:
+#                     start_idx_of_cur = i 
+#                     cur_tot_toks = self.tot_num_tokens[i]
+
+#                 dic = {
+#                     "total number of tokens": self.tot_num_tokens[i],
+#                     "iteration": i - start_idx_of_cur,
+#                 }
+#                 for j in range(self.num_experts):
+#                     dic[f"expert_{j} num tokens"] = self.num_token_each_expert[j][i]
+
+#                 for j in range(self.num_gpus):
+#                     dic[f"gpu:{j} latency (ms)"] = self.latencies[j][i]
+#                     dic[f"gpu:{j} num tokens"] = self.num_token_each_gpu[j][i]
+                       
+
+#                 writer.writerow(dic)
+
+#     def process_tokens_on_gpu(self, gpu_idx, hidden_states, router_mask, next_states, queue, expert_to_offload, max_tokens_to_a_single_expert, num_tokens_to_rebalance):
+#         torch.cuda.set_device(gpu_idx)
+#         start_event = torch.cuda.Event(enable_timing=True)
+#         end_event = torch.cuda.Event(enable_timing=True)
+        
+#         start_event.record()
+
+#         x = []
+#         for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
+#             expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
+#             data = hidden_states[router_mask[:, :, expert_idx]].to(f"cuda:{gpu_idx}", non_blocking=True)
+#             if expert_idx == expert_to_offload and num_tokens_to_rebalance > 0:
+#                 data = data[:-num_tokens_to_rebalance, :]
+#             x.append(data)
+        
+#         tokens = torch.cat(x, axis=0)
+#         shape = (tokens.shape[0], self.config.d_ff * len(self.gpu_idx_and_offset_to_expert[gpu_idx]))
+#         # Not used (so reserved in meta)
+#         data = torch.empty(
+#             400,
+#             128,
+#             128,
+#             device="meta"
+#         )
+#         topo = stk.Matrix(shape, data, )
+#         print(tokens.shape)
+#         response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens, topo).to("cuda:0", non_blocking=True)
+#         print(response.shape)
+#         exit(1)
+
+#         # (num_toks, d_model)
+#         # x = hidden_states[router_mask[:, :, self.gpu_idx_and_offset_to_expert[gpu_idx]]].to(f"cuda:{gpu_idx}", non_blocking=True)
+#         # print(x.shape)
+#         # exit(1)
+#         # if expert_to_offload in self.gpu_idx_and_offset_to_expert[gpu_idx]:
+#         #     i = self.gpu_idx_and_offset_to_expert[gpu_idx].index(expert_to_offload)
+
+
+#         # stack = []
+#         # largest = max_tokens_to_a_single_expert
+#         # sizes = []
+#         # for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
+#         #     expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
+#         #     data = hidden_states[router_mask[:, :, expert_idx]].to(f"cuda:{gpu_idx}", non_blocking=True)
+#         #     if expert_idx == expert_to_offload and num_tokens_to_rebalance > 0:
+#         #         data = data[:-num_tokens_to_rebalance, :]
+#         #         pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{gpu_idx}", non_blocking=True)
+#         #         stack.append(torch.cat((data, pad), dim=0))
+#         #         sizes.append(data.shape[0])
+#         #     else:
+#         #         pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{gpu_idx}", non_blocking=True)
+#         #         stack.append(torch.cat((data, pad), dim=0))
+#         #         sizes.append(data.shape[0])
+
+
+#         # tokens = torch.stack(stack)
+#         # response = self.gpu_experts[f"gpu_{gpu_idx}"].forward(tokens).to("cuda:0", non_blocking=True)
+
+#         end_event.record()
+#         torch.cuda.synchronize(gpu_idx)
+#         elapsed_time = start_event.elapsed_time(end_event)
+
+#         if num_tokens_to_rebalance > 0:
+#             inclusion_experts = self.gpu_idx_and_offset_to_expert[gpu_idx][:]
+#             inclusion_idx = list(range(len(inclusion_experts)))
+#             idx_of_offload = inclusion_experts.index(expert_to_offload)
+#             inclusion_experts.pop(idx_of_offload)
+#             inclusion_idx.pop(idx_of_offload)
+#             size_offload = sizes[idx_of_offload]
+#             sizes.pop(idx_of_offload)
+
+#             queue.put({
+#                 "latency": elapsed_time,
+#                 "mask": router_mask[:, :, inclusion_experts],
+#                 "states": response[inclusion_idx, :, :],
+#                 "sizes": sizes,
+#                 "mask-offload": router_mask[:, :, expert_to_offload],
+#                 "states-offload": response[idx_of_offload, :size_offload, :],
+#                 "size-offload": size_offload
+#             })
+#         else:
+#             queue.put({
+#                 "latency": elapsed_time,
+#                 "mask": router_mask[:, :, self.gpu_idx_and_offset_to_expert[gpu_idx]],
+#                 "states": response,
+#                 "sizes": sizes,
+#             })
+
+
+#     def process_offload_gpu(self, gpu_idx, offloaded, largest, hidden_states, router_mask, next_states, queue):
+#         return
+#         torch.cuda.set_device(gpu_idx)
+#         start_event = torch.cuda.Event(enable_timing=True)
+#         end_event = torch.cuda.Event(enable_timing=True)
+        
+#         start_event.record()
+
+#         stack = []
+#         idxs = []
+#         for idx in range(self.num_experts):
+#             if offloaded[idx] > 0:
+#                 data = hidden_states[router_mask[:, :, idx]][-offloaded[idx]:,:].to(f"cuda:{self.num_gpus-1}", non_blocking=True)
+#                 pad = torch.zeros(largest-data.shape[0], data.shape[1]).to(f"cuda:{self.num_gpus-1}", non_blocking=True)
+#                 stack.append(torch.cat((data, pad), dim=0))
+#                 idxs.append(idx)
+
+#         tokens = torch.stack(stack)
+#         response = self.offload(tokens, idxs=idxs).to("cuda:0", non_blocking=True)
+
+#         end_event.record()
+#         torch.cuda.synchronize(gpu_idx)
+#         elapsed_time = start_event.elapsed_time(end_event)
+#         queue.put({
+#             "latency": elapsed_time,
+#             'mask': [router_mask[:, :, idx] for idx in idxs],
+#             'states': response,
+#             'offloaded': [offloaded[idx] for idx in idxs]
+#         })
+
+
+#     def forward(self, hidden_states):
+#         r"""
+#         Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
+
+#         1- Gets the `router_mask` from the router. The shape of the mask is `(batch_size, sequence_length, num_expert)`
+#         and corresponds to the argmax of the `router_probs`. The probabilities are needed in the computation of the
+#         hidden states : they are broadcasted to the hidden states values (can be interpreted as a scaling factor).
+
+#         2- Dispatch the tokens to its associated experts. We do a classic for loop over the experts and assign for each
+#         expert the corresponding hidden states.
+
+#         """
+
+#         # Step 1: Get the router_mask from the router as wel as the probabilities
+#         router_mask, router_probs, router_logits = self.router(hidden_states)
+#         expert_index = torch.argmax(router_mask, dim=-1)
+
+#         # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
+#         # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
+
+#         next_states = hidden_states.clone()
+
+#         router_mask = router_mask.bool()
+#         batch_size, seq_len, num_experts = router_mask.shape
+#         idx_mask = router_mask.transpose(1, 2).reshape(batch_size * seq_len, num_experts).sum(dim=0)
+#         idx_mask = torch.nonzero(idx_mask, as_tuple=True)[
+#             0
+#         ].tolist()  # length: number of "activated" expert / value: index
+#         if self.num_gpus == 0:
+#             for idx in idx_mask:
+#                 next_states[router_mask[:, :, idx]] = self.experts[f"expert_{idx}"].forward(
+#                     hidden_states[router_mask[:, :, idx]])
+#         else:
+#             num_toks = hidden_states.shape[0] * hidden_states.shape[1]
+#             avg_num_toks = num_toks // self.num_gpus
+#             self.tot_num_tokens.append(num_toks)
+
+#             ######### BREAD AND BUTTER #############
+#             # Calculate amount to be offloaded
+#             offloaded = [0 for _ in range(self.num_experts)]
+#             expert_to_offload_list = [0 for _ in range(self.num_gpus-1)]
+#             max_tokens_to_a_single_expert_list = [0 for _ in range(self.num_gpus-1)]
+#             num_tokens_to_rebalance_list = [0 for _ in range(self.num_gpus-1)]
+
+#             for gpu_idx in range(self.num_gpus-1):
+#                 num_tokens_for_gpu = 0
+#                 max_index = -1
+#                 max_tokens_to_a_single_expert = 0
+#                 second_largest_num_tokens_to_a_single_expert = 0
+#                 for i in range(len(self.gpu_idx_and_offset_to_expert[gpu_idx])):
+#                     expert_idx = self.gpu_idx_and_offset_to_expert[gpu_idx][i]
+#                     num_tokens = hidden_states[router_mask[:, :, expert_idx]].shape[0]
+#                     self.num_token_each_expert[expert_idx].append(num_tokens)
+#                     num_tokens_for_gpu += num_tokens
+#                     if num_tokens > max_tokens_to_a_single_expert:
+#                         second_largest_num_tokens_to_a_single_expert = max_tokens_to_a_single_expert
+#                         max_tokens_to_a_single_expert = num_tokens
+#                         max_index = expert_idx
+#                     elif num_tokens > second_largest_num_tokens_to_a_single_expert:
+#                         second_largest_num_tokens_to_a_single_expert = num_tokens
+
+#                 # Then rebalance 
+#                 ## Get number of tokens to rebalance
+#                 num_tokens_to_rebalance = num_tokens_for_gpu - int(avg_num_toks * 1.15)
+#                 num_tokens_to_rebalance = max(0, num_tokens_to_rebalance)
+#                 self.num_token_each_gpu[gpu_idx].append(num_tokens_for_gpu - num_tokens_to_rebalance)
+#                 if num_tokens_to_rebalance > 0:
+#                     # We will rebalance the tokens from the expert with the most
+#                     offloaded[max_index] = num_tokens_to_rebalance
+#                 expert_to_offload_list[gpu_idx] = max_index
+#                 max_tokens_to_a_single_expert_list[gpu_idx] = max(max_tokens_to_a_single_expert - num_tokens_to_rebalance, second_largest_num_tokens_to_a_single_expert)
+#                 num_tokens_to_rebalance_list[gpu_idx] = num_tokens_to_rebalance
+            
+#             self.num_token_each_gpu[self.num_gpus-1].append(sum(offloaded))
+#             largest_offloaded_amt = max(offloaded)
+           
+#             threads = []
+#             queues = [Queue() for _ in range(self.num_gpus)]
+#             for gpu_idx in range(self.num_gpus):
+#                 if gpu_idx == self.num_gpus - 1:
+#                     thread = threading.Thread(target=self.process_offload_gpu, args=(
+#                         gpu_idx,
+#                         offloaded, 
+#                         largest_offloaded_amt,
+#                         hidden_states,
+#                         router_mask, next_states, queues[gpu_idx]
+#                     ))
+#                 else:
+#                     thread = threading.Thread(target=self.process_tokens_on_gpu, args=(
+#                         gpu_idx,
+#                         hidden_states,
+#                         router_mask,
+#                         next_states,
+#                         queues[gpu_idx],
+#                         expert_to_offload_list[gpu_idx], 
+#                         max_tokens_to_a_single_expert_list[gpu_idx],
+#                         num_tokens_to_rebalance_list[gpu_idx]
+#                     ))
+#                 thread.start()
+#                 threads.append(thread)
+
+#             for gpu_idx in range(self.num_gpus):
+#                 result = queues[gpu_idx].get()
+#                 self.latencies[gpu_idx].append(result['latency'])
+#                 if "offloaded" in result:
+#                     for idx, offload in enumerate(result["offloaded"]):
+#                         next_states[result["mask"][idx]][-offload:, :] = result["states"][idx, :offload, :]
+#                 else:
+#                     for idx, size in enumerate(result["sizes"]):
+#                         next_states[result["mask"][:, :, idx]] = result["states"][idx, :size, :]
+#                     if "mask-offload" in result:
+#                         next_states[result["mask-offload"]][:result["size-offload"], :] = result["states-offload"]
+
+#             for thread in threads:
+#                 thread.join()
+
+           
+                
+#         torch.cuda.synchronize()
+#         hidden_states = router_probs * next_states
+#         return hidden_states, (router_logits, expert_index)
 
 class SwitchTransformersLayerFF(nn.Module):
     r"""
