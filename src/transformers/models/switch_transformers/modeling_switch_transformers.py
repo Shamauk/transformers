@@ -387,6 +387,7 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.gpu_experts[f"gpu_{gpu_idx}"] = self.gpu_experts[f"gpu_{gpu_idx}"].to(f"cuda:{gpu_idx}")
         
     def expert_save_latencies(self, DIR=""):
+        return
         with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
             fieldnames = ["total number of tokens", "iteration", "expert_0 num tokens", "expert_1 num tokens", "expert_2 num tokens", 
             "expert_3 num tokens", "expert_4 num tokens", "expert_5 num tokens", "expert_6 num tokens", "expert_7 num tokens", 
@@ -642,35 +643,40 @@ class SwitchTransformersSparseMLP(nn.Module):
             def callback(future):
                 with torch.cuda.stream(self.comm_in_stream):
                     _input = future.value().to(f"cuda:{gpu_idx}", non_blocking=True)
+
+                    # Do not return the callback until finished
                     self.comm_in_events[gpu_idx].record()
+                    self.comm_in_events[gpu_idx].synchronize()
+                    
+
                     return _input
             return callback 
         
         def perform_computation(gpu_idx):
             def callback(future):
                 with torch.cuda.stream(self.comp_streams[gpu_idx]):
-                    self.comm_in_events[gpu_idx].wait()
                     _input = future.value()
                     if gpu_idx != self.num_gpus-1:
                         _output = self.gpu_experts[f"gpu_{gpu_idx}"].forward(_input)
                     else:
                         _output = self.offload.forward(_input, idxs=offload_experts_idx)
+
+                    # Do not return the callback until finished
                     self.comp_events[gpu_idx].record()
+                    self.comp_events[gpu_idx].synchronize()
+
                     return _output
             return callback
 
         def send_output(gpu_idx):
             def callback(future):
                 with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
-                    self.comp_events[gpu_idx].wait()
                     output = future.value()
                     outputs[gpu_idx] = output.to(next_states.device, non_blocking=True)
             return callback
 
-        futures = []
-        for (gpu_idx,_) in sorted_gpu_tokens:
-            self.start_events[gpu_idx].record()
-
+        
+        def do_work_on_gpu(gpu_idx):
             future = torch.futures.Future()
             future.set_result(inputs_to_send[gpu_idx])
             
@@ -678,12 +684,26 @@ class SwitchTransformersSparseMLP(nn.Module):
             future = future.then(perform_computation(gpu_idx))
             future = future.then(send_output(gpu_idx))
 
-            futures.append(future)   
+        # futures = []
+        threads = []
+        for (gpu_idx,_) in sorted_gpu_tokens:
+            #self.start_events[gpu_idx].record()
+            thread = threading.Thread(target=do_work_on_gpu, args=(gpu_idx,))
+            thread.start()
+            threads.append(thread)
+            
 
-            self.end_events[gpu_idx].record()    
+            # futures.append(future)   
 
-        for future in futures:
-            torch.jit._wait(future)
+            #self.end_events[gpu_idx].record()    
+
+        # for future in futures:
+        #     torch.jit._wait(future)
+
+        for thread in threads:
+            thread.join()
+
+        torch.cuda.synchronize()
 
         # for (gpu_idx, _) in sorted_gpu_tokens:
         #     with torch.cuda.stream(self.comm_in_stream):             
@@ -748,11 +768,12 @@ class SwitchTransformersSparseMLP(nn.Module):
                         else:
                             next_states[masks[idx]][-amt:] = outputs[gpu_idx][cur][:-paddings[-1][cur]]
                         cur += 1
+            
+            # Get time spent on GPU
+            #self.latencies[gpu_idx].append(self.start_events[gpu_idx]
+            #    .elapsed_time(self.end_events[gpu_idx]))
 
-        for gpu_idx in range(self.num_gpus):
-            self.latencies[gpu_idx].append(self.start_events[gpu_idx]
-                .elapsed_time(self.end_events[gpu_idx]))
-        
+           
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
 
