@@ -572,25 +572,21 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.end_events[expert_idx].record()
         return _output
 
-    async def process_experts(self, hidden_states, router_mask):
-        schedule = [
-            (0,0,hidden_states[router_mask[:,:,0]]), 
-            (1,0,hidden_states[router_mask[:,:,1]]), 
-            (2,1,hidden_states[router_mask[:,:,2]]), 
-            (4,2,hidden_states[router_mask[:,:,4]]), 
-            (6,3,hidden_states[router_mask[:,:,6]]), 
-            (3,1,hidden_states[router_mask[:,:,3]]), 
-            (5,2,hidden_states[router_mask[:,:,5]]), 
-            (7,3,hidden_states[router_mask[:,:,7]]),
-        ]
-
-        tasks = [self.do_work_on_expert(expert_idx, gpu_idx, _input) for expert_idx, gpu_idx, _input in schedule]
+    async def process_experts(self, schedule):
+        tasks = [self.do_work_on_expert(schedule[0][idx], schedule[1][idx], schedule[2][idx]) for idx in range(len(schedule[0]))]
         outputs = await asyncio.gather(*tasks)
 
         return outputs
 
-    def run(self, hidden_states, router_mask):
-        return asyncio.run(self.process_experts(hidden_states, router_mask))
+    def schedule_naive(self, hidden_states, router_mask):
+        experts = [2, 4, 6, 3, 5, 7, 0, 1]
+        gpus = [1, 2, 3, 1, 2, 3, 0, 0]
+        inputs = [hidden_states[router_mask[:,:,idx]] for idx in experts]
+
+        return (experts, gpus, inputs)
+
+    def run(self, schedule):
+        return asyncio.run(self.process_experts(schedule))
 
     @torch.no_grad()
     def forward(self, hidden_states):
@@ -600,7 +596,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         router_mask = router_mask.bool()
         
         batch_size, seq_len, num_experts = router_mask.shape
-        # outputs = [None for _ in range(self.num_experts)]
 
         num_toks = hidden_states.shape[0]*hidden_states.shape[1]
         self.tot_num_tokens.append(num_toks)
@@ -608,91 +603,11 @@ class SwitchTransformersSparseMLP(nn.Module):
         num_toks_per_expert = [0 for _ in range(self.num_experts)]
         num_toks_per_gpu = [0 for _ in range(self.num_gpus)]
 
-        # def send_input(gpu_idx, expert_idx):
-        #     def callback(future):
-        #         with torch.cuda.stream(self.comm_in_streams[expert_idx]):
-        #             _input = future.value().to(f"cuda:{gpu_idx}", non_blocking=True)
-
-        #             # Do not return the callback until finished
-        #             self.comm_in_events[expert_idx].record()
-        #             self.comm_in_events[expert_idx].synchronize()
-
-        #             return _input
-        #     return callback 
+        schedule = self.schedule_naive(hidden_states, router_mask)
+        outputs = self.run(schedule)
         
-        # def perform_computation(expert, gpu_idx, expert_idx):
-        #     def callback(future):
-        #         with torch.cuda.stream(self.comp_streams[expert_idx]):
-        #             _output = expert.forward(future.value())
-                    
-        #             # Do not return the callback until finished
-        #             self.comp_events[expert_idx].record()
-        #             self.comp_events[expert_idx].synchronize()
-
-        #             return _output
-        #     return callback
-
-        # def send_output(gpu_idx, expert_idx):
-        #     def callback(future):
-        #         with torch.cuda.stream(self.comm_out_streams[expert_idx]):
-        #             outputs[expert_idx] = future.value().to(f"cuda:{gpu_idx}", 
-        #                 non_blocking=True)
-        #     return callback
-
-        # def do_work_on_expert(expert_idx, gpu_idx, _input):
-        #     self.start_events[expert_idx].record()
-
-        #     # Collect stats
-        #     num_toks = _input.shape[0]
-        #     num_toks_per_expert[expert_idx] = num_toks
-        #     num_toks_per_gpu[gpu_idx] += num_toks
-
-        #     # Create my future with callbacks
-        #     future = torch.futures.Future()
-        #     future.set_result(_input)
-        #     future = future.then(send_input(gpu_idx, expert_idx))
-        #     future = future.then(perform_computation(self.experts[f"expert_{expert_idx}"], gpu_idx, expert_idx))
-        #     future = future.then(send_output(0, expert_idx))
-        #     self.end_events[expert_idx].record()
-        
-
-        # schedule = [
-        #     (0,0,hidden_states[router_mask[:,:,0]]), 
-        #     (2,1,hidden_states[router_mask[:,:,2]]), 
-        #     (4,2,hidden_states[router_mask[:,:,4]]), 
-        #     (6,3,hidden_states[router_mask[:,:,6]]), 
-        #     (1,0,hidden_states[router_mask[:,:,1]]), 
-        #     (3,1,hidden_states[router_mask[:,:,3]]), 
-        #     (5,2,hidden_states[router_mask[:,:,5]]), 
-        #     (7,3,hidden_states[router_mask[:,:,7]])
-        # ]
-
-        # threads = []
-        # for expert_idx, gpu_idx, _input in schedule:
-        #     thread = threading.Thread(target=do_work_on_expert, 
-        #             args=(expert_idx, gpu_idx, _input))
-        #     thread.start()
-        #     threads.append(thread)
-            
-        # for thread in threads:
-        #     thread.join()
-
-        # with ThreadPoolExecutor(max_workers=16) as executor:  # Adjust max_workers as needed
-        #     futures = []
-        #     for expert_idx, gpu_idx, _input in schedule:
-        #         future = executor.submit(do_work_on_expert, expert_idx, gpu_idx, _input)
-        #         futures.append(future)
-            
-        #     # Wait for all futures to complete
-        #     for future in futures:
-        #         future.result()
-        #         torch.cuda.synchronize()
-
-        outputs = self.run(hidden_states, router_mask)
-        
-        experts_order = [0,1,2,4,6,3,5,7]
         for idx, output in enumerate(outputs):
-            expert_idx = experts_order[idx]
+            expert_idx = schedule[0][idx]
             next_states[router_mask[:,:,expert_idx]] = output
             self.num_token_each_expert[expert_idx].append(num_toks_per_expert[expert_idx])
     
@@ -710,12 +625,6 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
-
-   
-        # Add in the order of execution expert each gpu is responsible for 
-        # expert_schedule = [[] for _ in range(self.num_gpus)]
-        
-
 
         
 
