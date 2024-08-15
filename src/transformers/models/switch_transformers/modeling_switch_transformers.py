@@ -493,9 +493,13 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.gpu_experts = nn.ModuleDict()
 
         # The streams should have one for each executing entity (thread) same with events 
-        self.comm_in_streams = [torch.cuda.Stream(device=f"cuda:0") for i in range(self.num_experts)]
-        self.comm_out_streams = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
-        self.comp_streams = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
+        # self.comm_in_streams = [torch.cuda.Stream(device=f"cuda:0") for i in range(self.num_experts)]
+        # self.comm_out_streams = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
+        # self.comp_streams = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
+        
+        self.comm_in_stream = torch.cuda.Stream(device="cuda:0")
+        self.comm_out_streams = [torch.cuda.Stream(device=f"cuda:{i}") for i in range(self.num_gpus)]
+        self.comp_streams = [torch.cuda.Stream(device=f"cuda:{i}") for i in range(self.num_gpus)]
 
         self.comm_in_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
         self.comp_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
@@ -540,21 +544,21 @@ class SwitchTransformersSparseMLP(nn.Module):
                 writer.writerow(dic)
     
     async def send_input(self, gpu_idx, expert_idx, _input):
-        with torch.cuda.stream(self.comm_in_streams[expert_idx]):
+        with torch.cuda.stream(self.comm_in_stream):
             _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
             self.comm_in_events[expert_idx].record()
             await self.cuda_event_wait(self.comm_in_events[expert_idx])
         return _input
 
     async def perform_computation(self, expert, gpu_idx, expert_idx, _input):
-        with torch.cuda.stream(self.comp_streams[expert_idx]):
+        with torch.cuda.stream(self.comp_streams[gpu_idx]):
             _output = expert.forward(_input)
             self.comp_events[expert_idx].record()
             await self.cuda_event_wait(self.comp_events[expert_idx])
         return _output
 
     async def send_output(self, gpu_idx, expert_idx, _output):
-        with torch.cuda.stream(self.comm_out_streams[expert_idx]):
+        with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
             _output = _output.to(f"cuda:{gpu_idx}", non_blocking=True)
         return _output
 
@@ -579,8 +583,8 @@ class SwitchTransformersSparseMLP(nn.Module):
         return outputs
 
     def schedule_naive(self, hidden_states, router_mask):
-        experts = [2, 4, 6, 3, 5, 7, 0, 1]
-        gpus = [1, 2, 3, 1, 2, 3, 0, 0]
+        experts = [2, 4, 6, 0, 3, 5, 7, 1]
+        gpus = [1, 2, 3, 0, 1, 2, 3, 0]
         inputs = [hidden_states[router_mask[:,:,idx]] for idx in experts]
 
         return (experts, gpus, inputs)
