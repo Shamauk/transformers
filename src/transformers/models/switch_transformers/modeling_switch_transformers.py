@@ -45,7 +45,7 @@ from .configuration_switch_transformers import SwitchTransformersConfig
 import csv
 
 import threading
-from queue import Queue
+import queue
 
 import torch.multiprocessing as mp
 import nvtx 
@@ -55,6 +55,7 @@ import time
 
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import queue
 
 logger = logging.get_logger(__name__)
 
@@ -65,10 +66,6 @@ _CHECKPOINT_FOR_DOC = "google/switch-base-8"
 # This dict contains ids and associated url
 # for the pretrained weights provided with the models
 ####################################################
-
-
-# if __name__ == '__main__':
-#     mp.set_start_method('spawn')
 
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
@@ -270,15 +267,12 @@ ALL_LAYERNORM_LAYERS.append(SwitchTransformersLayerNorm)
 
 # Copied from transformers.models.t5.modeling_t5.T5DenseActDense with T5->SwitchTransformers
 class SwitchTransformersDenseActDense(nn.Module):
-    def __init__(self, config: SwitchTransformersConfig, expert_idx=None, layer_idx=None):
+    def __init__(self, config: SwitchTransformersConfig):
         super().__init__()
         self.wi = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout_rate)
-        self.act = ACT2FN[config.dense_act_fn]
-        self.expert_idx = expert_idx
-        self.layer_idx = layer_idx
-       
+        self.act = nn.ReLU()
 
     def forward(self, hidden_states):
         hidden_states = self.wi(hidden_states)
@@ -316,7 +310,7 @@ class SwitchTransformersSparseMLP_Naive(nn.Module):
         # Step 2: Get the experts (for loading)
         self.experts = nn.ModuleDict()
         for idx in range(self.num_experts):
-            self.experts[f"expert_{idx}"] = expert_class(config, expert_idx=idx, layer_idx=layer_idx)
+            self.experts[f"expert_{idx}"] = expert_class(config)
 
         self.gpu_experts = nn.ModuleDict()
 
@@ -459,8 +453,193 @@ class SwitchTransformersSparseMLP_Naive(nn.Module):
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
 
+# global_experts = None
+
+# def init_worker(experts):
+#     global global_experts
+#     global_experts = experts
+
+# def send_input_and_perform_computation(gpu_idx, expert_idx, _input):
+#         with torch.cuda.stream(torch.cuda.Stream(device=f"cuda:{gpu_idx}")):
+#             _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
+#             expert = global_experts[f"gpu_{gpu_idx}"][f"expert_{expert_idx}"]
+#             _output = expert.forward(_input)
+#             e = torch.cuda.Event(enable_timing=False)
+#             e.record()
+#             e.synchronize()
+#             return _output 
+
+# def send_output(gpu_idx, _output):
+#         with torch.cuda.stream(torch.cuda.Stream(device=f"cuda:{gpu_idx}")):
+#             _output = _output.to(f"cuda:{gpu_idx}", non_blocking=True)
+#         return _output
+
+# def do_work_on_expert(gpu_idx, expert_idx, _input):
+#         _output = send_input_and_perform_computation(gpu_idx, expert_idx, _input)
+#         _output = send_output(0, _output)
+#         return _output 
+
+
+def send_input_and_perform_computation(gpu_idx, expert, _input):
+    with torch.cuda.stream(torch.cuda.Stream(device=f"cuda:{gpu_idx}")):
+        _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
+        _output = expert.forward(_input)
+        e = torch.cuda.Event(enable_timing=False)
+        e.record()
+        e.synchronize()
+        return _output 
+
+def send_output(gpu_idx, _output):
+    with torch.cuda.stream(torch.cuda.Stream(device=f"cuda:{gpu_idx}")):
+        _output = _output.to(f"cuda:{gpu_idx}", non_blocking=True)
+    return _output
+
+def do_work_on_expert(gpu_idx, expert_state_dict, _input):
+    expert = SwitchTransformersDenseActDense()
+    expert.load_state_dict(expert_state_dict)
+    _output = send_input_and_perform_computation(gpu_idx, expert, _input)
+    _output = send_output(0, _output)
+    return _output
+
+
+from torch.multiprocessing import Queue
+
+class ExpertManager:
+    def __init__(self, config):
+        self.config = config
+        self.num_gpus = config.num_gpus
+        
+        self.input_queues = [Queue() for _ in range(self.num_gpus)]
+        self.output_queues = [Queue() for _ in range(self.num_gpus)]
+
+        # self.processes = []
+        
+    
+    # experts is an array of length num_gpus
+    # each entry is tuple of expert_idx and its weights
+    def initialize_experts(self, experts):   
+        self.processes = []
+        for idx in range(self.num_gpus):
+            mp.Process(target=self._run_gpu_process, args=(idx, copy.deepcopy(experts[idx]))).start()
+
+
+    def _run_gpu_process(self, gpu_idx, experts_data):
+        # # Setup
+        torch.cuda.set_device(gpu_idx)
+        experts = nn.ModuleDict()
+        for expert_idx, weights in experts_data:
+            expert = SwitchTransformersDenseActDense(self.config)
+            expert.load_state_dict(weights)
+            expert = expert.to(f"cuda:{gpu_idx}")
+            experts[f"expert_{expert_idx}"] = expert
+        
+        while True:
+            task = self.input_queues[gpu_idx].get()
+            if task is None:
+                break
+            expert_idx, _input = task
+            output = self._process_input(experts[f"expert_{expert_idx}"], _input, gpu_idx, expert_idx)
+            self.output_queues[gpu_idx].put(output)
+
+    def _process_input(self, expert, _input, gpu_idx, expert_idx):
+        with torch.cuda.stream(torch.cuda.Stream(device=f"cuda:{gpu_idx}")):
+            _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
+            with torch.no_grad():
+                output = expert(_input)
+            return (expert_idx, output.to('cuda:0', non_blocking=True))
+    
+    def run(self, schedule, experts):  
+        try:
+            self.initialize_experts(experts)
+
+            results = []
+            for gpu_idx, expert_idx, _input in zip(schedule[1], schedule[0], schedule[2]):
+                self.input_queues[gpu_idx].put((expert_idx, _input))
+            
+            for i in range(len(schedule[0])):
+                gpu_idx = schedule[1][i]
+                results.append(self.output_queues[gpu_idx].get())
+
+            self.stop()
+
+            return results
+        except Exception as e:
+            print(f"Error in run method: {str(e)}")
+            return None
+    
+    def stop(self):
+        for i in range(len(self.input_queues)):
+            self.input_queues[i].put(None)
+
+
+class ThreadExpertManager():
+    def __init__(self, experts):
+        self.experts = experts
+
+    def _run_task(self, expert, _input, gpu_idx, expert_idx, output_queue):
+        with torch.cuda.stream(torch.cuda.Stream(device=f"cuda:{gpu_idx}")):
+            _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
+            with torch.no_grad():
+                output = expert(_input)
+            e = torch.cuda.Event(enable_timing=False)
+            e.record()
+            e.synchronize()
+            output = output.to('cuda:0', non_blocking=True)
+            output_queue.put((expert_idx, output))
+    
+    def run(self, schedule):
+        threads = []
+        output_queue = queue.Queue()
+
+        for gpu_idx, expert_idx, _input in zip(schedule[1], schedule[0], schedule[2]):
+            thread = threading.Thread(target=self._run_task, 
+                args=(
+                    self.experts[f"gpu_{gpu_idx}"][f"expert_{expert_idx}"],
+                    _input,
+                    gpu_idx,
+                    expert_idx,
+                    output_queue
+                ))
+            thread.start()
+            threads.append(thread)
+        
+        for thread in threads:
+            thread.join()
+
+        _len = len(schedule[0])
+        outputs = []
+        for _ in range(_len):
+            outputs.append(output_queue.get())
+        
+        return outputs 
+
+    
+# def process_experts(self, schedule):
+#         threads = []
+#         output_queue = queue.Queue()
+#         _len = len(schedule[0])
+#         outputs = [None for _ in range(_len)]
+#         for idx in range(_len):
+#             thread = threading.Thread(target=self.do_work_on_expert, args=(schedule[0][idx], schedule[1][idx], schedule[2][idx], output_queue, idx))
+#             thread.start()
+#             threads.append(thread)
+        
+#         for idx, thread in enumerate(threads):
+#             thread.join()
+        
+#         while not output_queue.empty():
+#             idx, output = output_queue.get()
+#             outputs[idx] = output
+
+#         return outputs
+
+
+
+
 
 # AdNexus
+# TO NOTE:
+# May want to have a stream per executing entity rather than gpu, but for now seems ok.
 class SwitchTransformersSparseMLP(nn.Module):
     def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None):
         super().__init__()
@@ -488,31 +667,40 @@ class SwitchTransformersSparseMLP(nn.Module):
         # Step 2: Get the experts (for loading)
         self.experts = nn.ModuleDict()
         for idx in range(self.num_experts):
-            self.experts[f"expert_{idx}"] = expert_class(config, expert_idx=idx, layer_idx=layer_idx)
+            self.experts[f"expert_{idx}"] = expert_class(config)
 
-        self.gpu_experts = nn.ModuleDict()
-
-        # The streams should have one for each executing entity (thread) same with events 
-        # self.comm_in_streams = [torch.cuda.Stream(device=f"cuda:0") for i in range(self.num_experts)]
-        # self.comm_out_streams = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
-        # self.comp_streams = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
+        # self.gpu_experts = nn.ModuleDict()
         
         self.comm_in_stream = torch.cuda.Stream(device="cuda:0")
         self.comm_out_streams = [torch.cuda.Stream(device=f"cuda:{i}") for i in range(self.num_gpus)]
         self.comp_streams = [torch.cuda.Stream(device=f"cuda:{i}") for i in range(self.num_gpus)]
-
-        self.comm_in_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
-        self.comp_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
         
+        self.streams = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
+
+        self.comms = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
+        self.comps = [torch.cuda.Stream(device=f"cuda:{i // self.num_experts_per_gpu}") for i in range(self.num_experts)]
+
+
         self.start_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_experts)]
         self.end_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_experts)]
 
+
     def expert_parallelise(self):
-        # Place the experts (expert_parallelism)
-        for idx in range(self.num_experts):
-            gpu_idx = idx // self.num_experts_per_gpu
-            self.experts[f"expert_{idx}"] = self.experts[f"expert_{idx}"].to(f"cuda:{gpu_idx}")
-        
+        self.expert_manager = ExpertManager(self.config)
+        self.expert_manager_experts = [[(i, self.experts[f"expert_{i}"].state_dict()) for i in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+        # Duplicate the model's experts onto each GPU
+
+        self.gpu_experts = nn.ModuleDict()
+        for i in range(self.num_gpus):
+            experts = nn.ModuleDict()
+            for j in range(self.num_experts):
+                expert = SwitchTransformersDenseActDense(self.config)
+                expert.wi.weight.data = self.experts[f"expert_{j}"].wi.weight.data.clone()
+                expert.wo.weight.data = self.experts[f"expert_{j}"].wo.weight.data.clone()
+                experts[f"expert_{j}"] = expert  
+            self.gpu_experts[f"gpu_{i}"] = experts.to(f"cuda:{i}")   
+        self.threads_expert_manager = ThreadExpertManager(self.gpu_experts)
         
     def expert_save_latencies(self, DIR=""):
         with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
@@ -543,54 +731,166 @@ class SwitchTransformersSparseMLP(nn.Module):
 
                 writer.writerow(dic)
     
-    async def send_input(self, gpu_idx, expert_idx, _input):
-        with torch.cuda.stream(self.comm_in_stream):
-            _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
-            self.comm_in_events[expert_idx].record()
-            await self.cuda_event_wait(self.comm_in_events[expert_idx])
-        return _input
+    # async def send_input(self, gpu_idx, expert_idx, _input):
+    #     with torch.cuda.stream(self.comm_in_stream):
+    #         _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
+    #         e = torch.cuda.Event(enable_timing=False)
+    #         e.record()
+    #         await self.cuda_event_wait(e)
+    #     return _input
 
-    async def perform_computation(self, expert, gpu_idx, expert_idx, _input):
-        with torch.cuda.stream(self.comp_streams[gpu_idx]):
-            _output = expert.forward(_input)
-            self.comp_events[expert_idx].record()
-            await self.cuda_event_wait(self.comp_events[expert_idx])
-        return _output
+    # async def perform_computation(self, gpu_idx, expert_idx, _input):
+    #     with torch.cuda.stream(self.comp_streams[gpu_idx]):
+    #         _output = self.gpu_experts[f"gpu_{gpu_idx}"][f"expert_{expert_idx}"].forward(_input)
+    #         e = torch.cuda.Event(enable_timing=False)
+    #         e.record()
+    #         await self.cuda_event_wait(e)
+    #     return _output
 
-    async def send_output(self, gpu_idx, expert_idx, _output):
-        with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
-            _output = _output.to(f"cuda:{gpu_idx}", non_blocking=True)
-        return _output
+    # async def send_output(self, gpu_idx, expert_idx, _output):
+    #     with torch.cuda.stream(self.comm_out_streams[gpu_idx]):
+    #         _output = _output.to(f"cuda:{gpu_idx}", non_blocking=True)
+    #     return _output
+    
+    # async def send_input_and_perform_computation(self, gpu_idx, expert_idx, _input):
+    #     with torch.cuda.stream(self.streams[expert_idx]):
+    #         _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
+    #         _output = self.gpu_experts[f"gpu_{gpu_idx}"][f"expert_{expert_idx}"].forward(_input)
+            # e = torch.cuda.Event(enable_timing=False)
+            # e.record()
+    #         await self.cuda_event_wait(e)
+    #         return _output 
 
-    async def cuda_event_wait(self, event):
-        while not event.query():
-            await asyncio.sleep(0)
+    # async def send_output(self, gpu_idx, expert_idx, _output):
+    #     with torch.cuda.stream(self.streams[expert_idx]):
+    #         _output = _output.to(f"cuda:{gpu_idx}", non_blocking=True)
+    #     return _output
 
-    async def do_work_on_expert(self, expert_idx, gpu_idx, _input):
-        self.start_events[expert_idx].record()
+    # async def cuda_event_wait(self, event):
+    #     while not event.query():
+    #         await asyncio.sleep(0)
 
-        _input = await self.send_input(gpu_idx, expert_idx, _input)
-        _output = await self.perform_computation(self.experts[f"expert_{expert_idx}"], gpu_idx, expert_idx, _input)
-        _output = await self.send_output(0, expert_idx, _output)
+    # async def do_work_on_expert(self, expert_idx, gpu_idx, _input):
+    #     self.start_events[expert_idx].record()
 
-        self.end_events[expert_idx].record()
-        return _output
+    #     # _input = await self.send_input(gpu_idx, expert_idx, _input)
+    #     # _output = await self.perform_computation(gpu_idx, expert_idx, _input)
+    #     _output = await self.send_input_and_perform_computation(gpu_idx, expert_idx, _input)
+    #     _output = await self.send_output(0, expert_idx, _output)
 
-    async def process_experts(self, schedule):
-        tasks = [self.do_work_on_expert(schedule[0][idx], schedule[1][idx], schedule[2][idx]) for idx in range(len(schedule[0]))]
-        outputs = await asyncio.gather(*tasks)
+    #     self.end_events[expert_idx].record()
+    #     return _output
 
-        return outputs
+    # async def process_experts(self, schedule):
+    #     tasks = [self.do_work_on_expert(schedule[0][idx], schedule[1][idx], schedule[2][idx]) for idx in range(len(schedule[0]))]
+    #     outputs = await asyncio.gather(*tasks)
 
+    #     return outputs
+
+
+    # def send_input_and_perform_computation(self, gpu_idx, expert_idx, _input):
+    #     with torch.cuda.stream(self.streams[expert_idx]):
+    #         _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
+    #         _output = self.gpu_experts[f"gpu_{gpu_idx}"][f"expert_{expert_idx}"].forward(_input)
+    #         e = torch.cuda.Event(enable_timing=False)
+    #         e.record()
+    #         e.synchronize()
+    #         return _output 
+
+    # def send_input(self, gpu_idx, expert_idx, _input):
+    #     with torch.cuda.stream(self.comms[expert_idx]):
+    #         _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
+    #         e = torch.cuda.Event(enable_timing=False)
+    #         e.record()
+    #         e.synchronize()
+    #     return _input
+
+    # def perform_computation(self, gpu_idx, expert_idx, _input):
+    #     with torch.cuda.stream(self.comps[expert_idx]):
+    #         _output = self.gpu_experts[f"gpu_{gpu_idx}"][f"expert_{expert_idx}"].forward(_input)
+    #         e = torch.cuda.Event(enable_timing=False)
+    #         e.record()
+    #         e.synchronize()
+    #         return _output 
+
+    # def send_output(self, gpu_idx, expert_idx, _output):
+    #     with torch.cuda.stream(self.streams[expert_idx]):
+    #         _output = _output.to(f"cuda:{gpu_idx}", non_blocking=True)
+    #     return _output
+
+    # def do_work_on_expert(self, expert_idx, gpu_idx, _input):
+    #     # self.start_events[expert_idx].record()
+    #     _output = self.send_input_and_perform_computation(gpu_idx, expert_idx, _input)
+    #     # _input = self.send_input(gpu_idx, expert_idx, _input)
+    #     # _output = self.perform_computation(gpu_idx, expert_idx, _input)
+    #     _output = self.send_output(0, expert_idx, _output)
+    #     # self.end_events[expert_idx].record()
+    #     # output_queue.put((idx,  _output))
+    #     return _output 
+    
+    # def process_experts(self, schedule):
+    #     threads = []
+    #     output_queue = queue.Queue()
+    #     _len = len(schedule[0])
+    #     outputs = [None for _ in range(_len)]
+    #     for idx in range(_len):
+    #         thread = threading.Thread(target=self.do_work_on_expert, args=(schedule[0][idx], schedule[1][idx], schedule[2][idx], output_queue, idx))
+    #         thread.start()
+    #         threads.append(thread)
+        
+    #     for idx, thread in enumerate(threads):
+    #         thread.join()
+        
+    #     while not output_queue.empty():
+    #         idx, output = output_queue.get()
+    #         outputs[idx] = output
+
+    #     return outputs
+    
     def schedule_naive(self, hidden_states, router_mask):
         experts = [2, 4, 6, 0, 3, 5, 7, 1]
         gpus = [1, 2, 3, 0, 1, 2, 3, 0]
         inputs = [hidden_states[router_mask[:,:,idx]] for idx in experts]
 
         return (experts, gpus, inputs)
+    
+    def schedule_adnexus(self, hidden_states, router_mask):
+        pass 
+    
+    # Works only if we setup partial completion of an expert and not the whole 
+    def schedule_demeter(self, hidden_states, router_mask):
+        pass
 
-    def run(self, schedule):
-        return asyncio.run(self.process_experts(schedule))
+    # def run(self, schedule):
+    #     return asyncio.run(self.process_experts(schedule))
+
+    # def run(self, schedule):
+    #     return self.process_experts(schedule)
+    
+    
+
+    # def do_work_on_expert(self, expert_idx, gpu_idx, _input):
+    #     _output = self.send_input_and_perform_computation(gpu_idx, expert_idx, _input)
+    #     _output = self.send_output(0, expert_idx, _output)
+    #     return _output 
+
+    # stream, gpu_idx, expert, input
+
+    # def run(self, schedule):
+    #     _len = len(schedule[0])
+    #     mp.set_start_method('spawn', force=True)
+
+    #     with mp.Pool(processes=_len) as pool:
+    #         results = pool.starmap(do_work_on_expert, [
+    #                 (
+    #                     schedule[1][i],
+    #                     self.gpu_experts[f"gpu_{schedule[1][i]}"][f"expert_{schedule[0][i]}"].state_dict(),
+    #                     schedule[2][i],
+    #                 )
+    #             for i in range(_len)]
+    #         )
+    #             # zip(schedule[1], schedule[0], schedule[2]))
+    #     return results
 
     @torch.no_grad()
     def forward(self, hidden_states):
@@ -608,12 +908,15 @@ class SwitchTransformersSparseMLP(nn.Module):
         num_toks_per_gpu = [0 for _ in range(self.num_gpus)]
 
         schedule = self.schedule_naive(hidden_states, router_mask)
-        outputs = self.run(schedule)
+        # outputs = self.run(schedule)
+        # torch.cuda.synchronize()
+
+        # outputs = self.expert_manager.run(schedule, self.expert_manager_experts)
+        outputs = self.threads_expert_manager.run(schedule)
         
-        for idx, output in enumerate(outputs):
-            expert_idx = schedule[0][idx]
+        for expert_idx, output in outputs:
             next_states[router_mask[:,:,expert_idx]] = output
-            self.num_token_each_expert[expert_idx].append(num_toks_per_expert[expert_idx])
+            self.num_token_each_expert[expert_idx].append(output.shape[0])
     
         for gpu_idx in range(self.num_gpus):
             self.num_token_each_gpu[gpu_idx].append(num_toks_per_gpu[gpu_idx])
