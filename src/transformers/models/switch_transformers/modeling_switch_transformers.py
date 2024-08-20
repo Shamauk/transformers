@@ -355,7 +355,7 @@ class ThreadExpertManager():
     def __init__(self, experts):
         self.experts = experts
 
-    def _run_task(self, expert, _input, gpu_idx, expert_idx, output_queue):
+    def _run_task(self, expert, _input, gpu_idx, expert_idx, portion, output_queue):
         with torch.cuda.stream(torch.cuda.Stream(device=f"cuda:{gpu_idx}")):
             _input = _input.to(f"cuda:{gpu_idx}", non_blocking=True)
             with torch.no_grad():
@@ -364,19 +364,20 @@ class ThreadExpertManager():
             e.record()
             e.synchronize()
             output = output.to('cuda:0', non_blocking=True)
-            output_queue.put((expert_idx, output))
+            output_queue.put((expert_idx, portion, output))
     
     def run(self, schedule):
         threads = []
         output_queue = queue.Queue()
 
-        for gpu_idx, expert_idx, _input in zip(schedule[1], schedule[0], schedule[2]):
+        for gpu_idx, expert_idx, _input, portion in zip(schedule[1], schedule[0], schedule[2], schedule[3]):
             thread = threading.Thread(target=self._run_task, 
                 args=(
                     self.experts[f"gpu_{gpu_idx}"][f"expert_{expert_idx}"],
                     _input,
                     gpu_idx,
                     expert_idx,
+                    portion,
                     output_queue
                 ))
             thread.start()
@@ -432,12 +433,13 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.forward_start_event = torch.cuda.Event(enable_timing=True)
         self.forward_end_event = torch.cuda.Event(enable_timing=True)
 
+        self.scheduler = self.schedule_demeter
+
     def expert_parallelise(self):
-        self.expert_manager = ExpertManager(self.config)
-        self.expert_manager_experts = [[(i, self.experts[f"expert_{i}"].state_dict()) for i in range(self.num_experts)] for _ in range(self.num_gpus)]
+        # self.expert_manager = ExpertManager(self.config)
+        # self.expert_manager_experts = [[(i, self.experts[f"expert_{i}"].state_dict()) for i in range(self.num_experts)] for _ in range(self.num_gpus)]
 
         # Duplicate the model's experts onto each GPU
-
         self.gpu_experts = nn.ModuleDict()
         for i in range(self.num_gpus):
             experts = nn.ModuleDict()
@@ -449,6 +451,8 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.gpu_experts[f"gpu_{i}"] = experts.to(f"cuda:{i}")   
         self.threads_expert_manager = ThreadExpertManager(self.gpu_experts)
         
+        self.expert_manager = self.threads_expert_manager
+
     def expert_save_latencies(self, DIR=""):
         with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
             fieldnames = ["total number of tokens", "iteration", "latency (ms)"]
@@ -485,8 +489,9 @@ class SwitchTransformersSparseMLP(nn.Module):
         experts = [2, 4, 6, 0, 3, 5, 7, 1]
         gpus = [1, 2, 3, 0, 1, 2, 3, 0]
         inputs = [hidden_states[router_mask[:,:,idx]] for idx in experts]
+        portions = [(0,_input.shape[0]) for _input in inputs]
 
-        return (experts, gpus, inputs)
+        return (experts, gpus, inputs, portions)
     
     def schedule_adnexus(self, hidden_states, router_mask):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
@@ -511,6 +516,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         experts = []
         gpus = []
         inputs = []
+        portions = []
 
         num_experts_allocated = 0
         col = 0
@@ -521,21 +527,128 @@ class SwitchTransformersSparseMLP(nn.Module):
                     experts.append(expert_idx)
                     gpus.append(idx)
                     inputs.append(expert_inputs[expert_idx])
+                    portions.append((0, expert_inputs[expert_idx].shape[0]))
                     num_experts_allocated += 1
             col += 1
 
-        return (experts, gpus, inputs)
+        return (experts, gpus, inputs, portions)
+    
+    def schedule_adnexus_nexus(self, hidden_states, router_mask):
+        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
+        experts_to_schedule = [(idx, expert_inputs[idx].shape[0]) for idx in range(self.num_experts)]
+        cur_gpu_num_experts = [0 for _ in range(self.num_gpus)]
+        cur_gpu_num_tokens = [0 for _ in range(self.num_gpus)]
+        gpu_assignment = [[] for _ in range(self.num_gpus)]
+        experts_to_schedule.sort(reverse=True, key=lambda x: x[1])
+
+        while len(experts_to_schedule) != 0:
+            expert_idx, num_toks = experts_to_schedule.pop(0)
+
+            target_idx = 0
+            target_value = nexus.predict([[cur_gpu_num_experts[0]+1, cur_gpu_num_tokens[0]+num_toks]])[0]
+            for idx in list(range(1, self.num_gpus)):
+                p = nexus.predict([[cur_gpu_num_experts[idx]+1, cur_gpu_num_tokens[idx]+num_toks]])[0]
+                if p < target_value:
+                    target_idx = idx
+                    target_value = p 
+            
+            cur_gpu_num_experts[target_idx] += 1
+            cur_gpu_num_tokens[target_idx] += num_toks
+            gpu_assignment[target_idx].append(expert_idx)
+
+        experts = []
+        gpus = []
+        inputs = []
+        portions = []
+
+        num_experts_allocated = 0
+        col = 0
+        while num_experts_allocated != self.num_experts:
+            for idx in list(range(1, self.num_gpus)) + [0]:
+                if col < len(gpu_assignment[idx]):
+                    expert_idx = gpu_assignment[idx][col]
+                    experts.append(expert_idx)
+                    gpus.append(idx)
+                    inputs.append(expert_inputs[expert_idx])
+                    portions.append((0, expert_inputs[expert_idx].shape[0]))
+                    num_experts_allocated += 1
+            col += 1
+
+        return (experts, gpus, inputs, portions)
+
+    # Here we will start with my 1.15 overflow to a GPU with the least
+    # For now let us not overflow but a single expert across all ranks
+    def schedule_demeter(self, hidden_states, router_mask):
+        experts_gpus = [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
+        experts_num_toks = [expert_inputs[idx].shape[0] for idx in range(self.num_experts)]
+        amt_tokens_each_gpu = [sum([experts_num_toks[i] for i in j]) for j in experts_gpus]
+        max_tokens_on_a_gpu = max(amt_tokens_each_gpu)
+        gpu_w_max_tokens = amt_tokens_each_gpu.index(max_tokens_on_a_gpu)
+        avg = sum(amt_tokens_each_gpu) / self.num_gpus
+        amount_to_redistribute = max_tokens_on_a_gpu - int(1.15 * avg)
+        amount_to_gpu = max_tokens_on_a_gpu - amount_to_redistribute
+        max_tokens_expert_in_gpu = max([experts_num_toks[idx] for idx in experts_gpus[gpu_w_max_tokens]])
+        max_expert_idx_in_gpu = experts_num_toks.index(max_tokens_expert_in_gpu)
+
+
+        # Will then add on the offloads
+        experts = [2, 4, 6, 0, 3, 5, 7, 1]
+        gpus = [1, 2, 3, 0, 1, 2, 3, 0]
+        inputs = [expert_inputs[idx] for idx in experts]
+        portions = [(0, experts_num_toks[idx]) for idx in experts]
+
+        # Update the offload
+        idx = experts.index(max_expert_idx_in_gpu)
+        inputs[idx] = inputs[idx][:amount_to_gpu]
+        portions[idx] = (0, amount_to_gpu)
+
+        # How do I want to move the extra around?
+        amt_tokens_each_gpu[gpu_w_max_tokens] = 0
+        s = sum(amt_tokens_each_gpu)
+        weights = [amt / s for amt in amt_tokens_each_gpu]
+        tokens_to_each = [math.floor(amount_to_redistribute * weight) for weight in weights]
+        m_idx = max(tokens_to_each)
+        tokens_to_each[tokens_to_each.index(m_idx)] += amount_to_redistribute - sum(tokens_to_each)
+
+        start = amount_to_gpu
+        for idx, amt in enumerate(tokens_to_each):
+            if amt == 0:
+                continue
+            end = start + amt
+            experts.append(max_expert_idx_in_gpu)
+            gpus.append(idx)
+            inputs.append(expert_inputs[max_expert_idx_in_gpu][start:end])
+            portions.append((start, end))
+            start = end
+
+
+        # print(experts_num_toks)
+        # print(amt_tokens_each_gpu)
+        # print(gpu_w_max_tokens)
+        # print(avg)
+        # print(amount_to_redistribute)
+        # print(max_expert_idx_in_gpu)
+        # print(weights)
+        # print(tokens_to_each)
+
+        # print(experts)
+        # print(gpus)
+        # print(portions)
+        # exit(1)
+
+        return (experts, gpus, inputs, portions)
+
+
+
+
+
 
         
-    
-    # Works only if we setup partial completion of an expert and not the whole 
-    def schedule_demeter(self, hidden_states, router_mask):
-        pass
 
     @torch.no_grad()
     def forward(self, hidden_states):
-        self.forward_start_event.record()
-
         router_mask, router_probs, router_logits = self.router(hidden_states)
         expert_index = torch.argmax(router_mask, dim=-1)
         next_states = hidden_states.clone()
@@ -549,58 +662,56 @@ class SwitchTransformersSparseMLP(nn.Module):
         num_toks_per_expert = [0 for _ in range(self.num_experts)]
         num_toks_per_gpu = [0 for _ in range(self.num_gpus)]
 
-        schedule = self.schedule_naive(hidden_states, router_mask)
-        # schedule = self.schedule_adnexus(hidden_states, router_mask)
+        schedule = self.scheduler(hidden_states, router_mask)
 
-        # outputs = self.expert_manager.run(schedule, self.expert_manager_experts)
-        outputs = self.threads_expert_manager.run(schedule)
-        
-        for expert_idx, output in outputs:
-            next_states[router_mask[:,:,expert_idx]] = output
+        self.forward_start_event.record()
+        outputs = self.expert_manager.run(schedule)
+        self.forward_end_event.record()
+        torch.cuda.synchronize()
+        diff = self.forward_start_event.elapsed_time(self.forward_end_event)
+        self.forward_latencies.append(diff)
+
+        for expert_idx, (start, stop), output in outputs:
+            next_states[router_mask[:,:,expert_idx]][start:stop,:] = output
             self.num_token_each_expert[expert_idx].append(output.shape[0])
     
         for gpu_idx in range(self.num_gpus):
             self.num_token_each_gpu[gpu_idx].append(num_toks_per_gpu[gpu_idx])
 
         hidden_states = router_probs * next_states
-
-        self.forward_end_event.record()
-        torch.cuda.synchronize()
-        diff = self.forward_start_event.elapsed_time(self.forward_end_event)
-        self.forward_latencies.append(diff)
         return hidden_states, (router_logits, expert_index)
 
         
 
 
 # Fusing
-class SwitchTransformersDenseActDenseFused(nn.Module):
-    def __init__(self, config: SwitchTransformersConfig, num_experts):
-        super().__init__()
-        self.dropout = nn.Dropout(config.dropout_rate)
-        self.act = ACT2FN[config.dense_act_fn]
+# class SwitchTransformersDenseActDenseFused(nn.Module):
+#     def __init__(self, config: SwitchTransformersConfig, num_experts):
+#         super().__init__()
+#         self.dropout = nn.Dropout(config.dropout_rate)
+#         self.act = ACT2FN[config.dense_act_fn]
 
-        # These are transposed the 1st and 2nd index of the original to enable bmm
-        self.wis = nn.Parameter(torch.zeros(num_experts, config.d_model, config.d_ff))
-        self.wos = nn.Parameter(torch.zeros(num_experts, config.d_ff, config.d_model))
+#         # These are transposed the 1st and 2nd index of the original to enable bmm
+#         self.wis = nn.Parameter(torch.zeros(num_experts, config.d_model, config.d_ff))
+#         self.wos = nn.Parameter(torch.zeros(num_experts, config.d_ff, config.d_model))
 
-        self.experts = []
+#         self.experts = []
     
-    def forward(self, hidden_states, idxs=None):
-        if idxs is None:
-            hidden_states = torch.bmm(hidden_states, self.wis)
-        else:
-            hidden_states = torch.bmm(hidden_states, self.wis[idxs, :, :])
+#     def forward(self, hidden_states, idxs=None):
+#         if idxs is None:
+#             hidden_states = torch.bmm(hidden_states, self.wis)
+#         else:
+#             hidden_states = torch.bmm(hidden_states, self.wis[idxs, :, :])
 
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.dropout(hidden_states)
+#         hidden_states = self.act(hidden_states)
+#         hidden_states = self.dropout(hidden_states)
 
-        if idxs is None:
-            hidden_states = torch.bmm(hidden_states, self.wos)
-        else:
-            hidden_states = torch.bmm(hidden_states, self.wos[idxs, :, :])
+#         if idxs is None:
+#             hidden_states = torch.bmm(hidden_states, self.wos)
+#         else:
+#             hidden_states = torch.bmm(hidden_states, self.wos[idxs, :, :])
 
-        return hidden_states
+#         return hidden_states
 
 # class SwitchTransformersSparseMLP_Demeter(nn.Module):
 #     r"""
