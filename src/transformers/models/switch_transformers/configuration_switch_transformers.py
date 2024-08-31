@@ -125,7 +125,6 @@ class SwitchTransformersConfig(PretrainedConfig):
         use_cache=True,
         pad_token_id=0,
         eos_token_id=1,
-        num_gpus=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -176,8 +175,6 @@ class SwitchTransformersConfig(PretrainedConfig):
         self.router_z_loss_coef = router_z_loss_coef
         self.router_aux_loss_coef = router_aux_loss_coef
         self.dense_act_fn = dense_act_fn
-
-        self.num_gpus = num_gpus
 
         super().__init__(
             pad_token_id=pad_token_id,
