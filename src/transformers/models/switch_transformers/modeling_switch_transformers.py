@@ -495,7 +495,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         max_num_rounds = max(map(lambda x: x[0], metadata)).item()
 
-        for r in range(max_num_rounds):
+        for r in range(max_num_rounds):            
             work_send = []
             for i in range(self.num_gpus):
                 if r < len(gpu_experts[i]):
@@ -508,97 +508,32 @@ class SwitchTransformersSparseMLP(nn.Module):
             for i in range(self.num_gpus):
                 work_receive.append(torch.empty((metadata[i][(r+1)*2].item(), self.config.d_model), device="cuda"))
 
+            torch.cuda.nvtx.range_push(f"Sending data")
             dist.all_to_all(work_receive, work_send)
+            torch.cuda.nvtx.range_pop()
 
+            torch.cuda.nvtx.range_push(f"Working")
             for i in range(self.num_gpus):
                 if work_receive[i].size(dim=0) != 0:
+                    torch.cuda.nvtx.range_push(f"Work from {i}")
                     work_receive[i] = self.experts[f"expert_{metadata[i][r*2 + 1]}"].forward(work_receive[i])
-
+                    torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop()
             
             # Send back
+            torch.cuda.nvtx.range_push(f"Sending results")
             dist.all_to_all(work_send, work_receive)
+            torch.cuda.nvtx.range_pop()
 
             # Update results 
+            torch.cuda.nvtx.range_push(f"Updating results")
             for i in range(self.num_gpus):
                 if work_send[i].size(dim=0) != 0:
-                    next_states[router_mask[:,:,gpu_experts[i][r][0]]][gpu_experts[i][r][1][0]:gpu_experts[i][r][1][1]] = work_send[i]
-
-            print("MADE IT HERE!")
-            exit(1)
-
-        _in = torch.tensor([_max for _ in range(self.num_gpus)], dtype=torch.int, device="cuda")
-        _out = torch.zeros(self.num_gpus, dtype=torch.int, device="cuda")
-        dist.all_to_all_single(_out, _in)
-        num_rounds = torch.max(_out).item()
-
-        for i in range(num_rounds):
-            for j in range(num_experts):
-                _in_sizes = []
-                if i < len(gpu_experts[j]):
-                    _in_sizes.append(gpu_experts[j][i].size(0))
-                else:
-                    _in_sizes.append(0)
-
-        print(num_rounds)
-        exit(1)
-
-
-        # Send tokens to everyone
-        input_tensors = [torch.empty((0,hidden_states.size(-1)), device="cuda") for _ in range(self.num_gpus)]
-        expert_indices = [torch.empty((0,), dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
-        input_sizes = torch.zeros(self.num_gpus, dtype=torch.int, device="cuda")
-
-        for i in range(len(inputs)):
-            input_tensors[gpus[i]] = torch.cat((input_tensors[gpus[i]], inputs[i]), dim=0)
-            expert_indices[gpus[i]] = torch.cat((expert_indices[gpus[i]], torch.tensor([experts[i]], device="cuda", dtype=torch.int)), dim=0)
-
-        for i, tensor in enumerate(input_tensors):
-            input_sizes[i] = tensor.size(0)
-
-        output_sizes = torch.zeros(self.num_gpus, dtype=torch.int, device="cuda")
-        dist.all_to_all_single(output_sizes, input_sizes)
-
-        if self.rank == 0:
-            for t in input_tensors:
-                print(t.device)        
-
-        output_tensors = [ torch.empty((output_sizes[i],hidden_states.size(-1)), device="cuda") 
-            for i in range(self.num_gpus)]
-        output_expert_indices = [ torch.empty((1,), device="cuda", dtype=torch.int) 
-            for i in range(self.num_gpus)]
-        dist.all_to_all(output_tensors, input_tensors)
-        dist.all_to_all(output_expert_indices, expert_indices)
-
-        print("DONE")
-        exit(1)
-
-        
-        # Join all experts together
-
-        for gpu_idx, experts in enumerate(_output):
-            for expert_idx, expert_tokens in enumerate(experts):
-                if expert_tokens.size(dim=0) != 0:
-                    _output[gpu_idx][expert_idx] = self.experts[f"expert_{i}"].forward(expert_tokens)
-
-
-        # Send result to everyone
-        dist.all_to_all(input_tensors, _output)
-
-        for experts in input_tensors:
-            for idx, expert_res in enumerate(experts):
-                if expert_res.size(dim=0) != 0:
-                    next_states[router_mask[:,:,idx]] = expert_res
-        # Need a way to know the portions
+                    next_states[router_mask[:,:,gpu_experts[i][r][0]]][gpu_experts[i][r][1][0]:gpu_experts[i][r][1][1],:] = work_send[i]
+            torch.cuda.nvtx.range_pop()
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
-
-
-
-            # The old
-        #for expert_idx, (start, stop), output in outputs:
-        #    next_states[router_mask[:,:,expert_idx]][start:stop,:] = output
-        # result = torch.zeros_like(_input)
 
 class SwitchTransformersLayerFF(nn.Module):
     r"""
