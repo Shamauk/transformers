@@ -44,6 +44,8 @@ from ...utils import (
 from .configuration_switch_transformers import SwitchTransformersConfig
 import csv
 
+import torch.distributed as dist
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "SwitchTransformersConfig"
@@ -468,21 +470,135 @@ class SwitchTransformersSparseMLP(nn.Module):
         next_states = hidden_states.clone()
         router_mask = router_mask.bool()
         
-        batch_size, seq_len, num_experts = router_mask.shape
+        experts, gpus, inputs, portions = self.scheduler(hidden_states, router_mask)
 
-        schedule = self.scheduler(hidden_states, router_mask)
+        gpu_experts = [[] for _ in range(self.num_gpus)]
 
-        # Here we need an allToAll
+        # Build my data structure
+        for i in range(len(experts)):
+            gpu_experts[gpus[i]].append((experts[i], portions[i], inputs[i]))
 
-        outputs = self.expert_manager.run(schedule)
+        # Find the max sends to a single gpu
+        _max = max(map(lambda x: len(x), gpu_experts))
+        max_metadata_size = 1 + (2 * self.num_experts) # Max work a gpu does it num_experts, since tokens are grouped by experts
+        _in = []
+        for i in range(self.num_gpus):
+            metadata = torch.zeros(max_metadata_size, dtype=torch.int, device="cuda")
+            metadata[0] = _max
+            for j in range(len(gpu_experts[i])):
+                metadata[j*2 + 1] = gpu_experts[i][j][0]
+                metadata[(j+1)*2] = gpu_experts[i][j][2].size(0)
+            _in.append(metadata)
+        
+        metadata = [torch.zeros(max_metadata_size, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
+        dist.all_to_all(metadata, _in)
 
-        # Here we need another allToAll
+        max_num_rounds = max(map(lambda x: x[0], metadata)).item()
 
-        for expert_idx, (start, stop), output in outputs:
-            next_states[router_mask[:,:,expert_idx]][start:stop,:] = output
+        for r in range(max_num_rounds):
+            work_send = []
+            for i in range(self.num_gpus):
+                if r < len(gpu_experts[i]):
+                    t = gpu_experts[i][r][2]
+                else:
+                    t = torch.empty((0,self.config.d_model), device="cuda")
+                work_send.append(t)
+
+            work_receive = []
+            for i in range(self.num_gpus):
+                work_receive.append(torch.empty((metadata[i][(r+1)*2].item(), self.config.d_model), device="cuda"))
+
+            dist.all_to_all(work_receive, work_send)
+
+            for i in range(self.num_gpus):
+                if work_receive[i].size(dim=0) != 0:
+                    work_receive[i] = self.experts[f"expert_{metadata[i][r*2 + 1]}"].forward(work_receive[i])
+
+            
+            # Send back
+            dist.all_to_all(work_send, work_receive)
+
+            # Update results 
+            for i in range(self.num_gpus):
+                if work_send[i].size(dim=0) != 0:
+                    next_states[router_mask[:,:,gpu_experts[i][r][0]]][gpu_experts[i][r][1][0]:gpu_experts[i][r][1][1]] = work_send[i]
+
+            print("MADE IT HERE!")
+            exit(1)
+
+        _in = torch.tensor([_max for _ in range(self.num_gpus)], dtype=torch.int, device="cuda")
+        _out = torch.zeros(self.num_gpus, dtype=torch.int, device="cuda")
+        dist.all_to_all_single(_out, _in)
+        num_rounds = torch.max(_out).item()
+
+        for i in range(num_rounds):
+            for j in range(num_experts):
+                _in_sizes = []
+                if i < len(gpu_experts[j]):
+                    _in_sizes.append(gpu_experts[j][i].size(0))
+                else:
+                    _in_sizes.append(0)
+
+        print(num_rounds)
+        exit(1)
+
+
+        # Send tokens to everyone
+        input_tensors = [torch.empty((0,hidden_states.size(-1)), device="cuda") for _ in range(self.num_gpus)]
+        expert_indices = [torch.empty((0,), dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
+        input_sizes = torch.zeros(self.num_gpus, dtype=torch.int, device="cuda")
+
+        for i in range(len(inputs)):
+            input_tensors[gpus[i]] = torch.cat((input_tensors[gpus[i]], inputs[i]), dim=0)
+            expert_indices[gpus[i]] = torch.cat((expert_indices[gpus[i]], torch.tensor([experts[i]], device="cuda", dtype=torch.int)), dim=0)
+
+        for i, tensor in enumerate(input_tensors):
+            input_sizes[i] = tensor.size(0)
+
+        output_sizes = torch.zeros(self.num_gpus, dtype=torch.int, device="cuda")
+        dist.all_to_all_single(output_sizes, input_sizes)
+
+        if self.rank == 0:
+            for t in input_tensors:
+                print(t.device)        
+
+        output_tensors = [ torch.empty((output_sizes[i],hidden_states.size(-1)), device="cuda") 
+            for i in range(self.num_gpus)]
+        output_expert_indices = [ torch.empty((1,), device="cuda", dtype=torch.int) 
+            for i in range(self.num_gpus)]
+        dist.all_to_all(output_tensors, input_tensors)
+        dist.all_to_all(output_expert_indices, expert_indices)
+
+        print("DONE")
+        exit(1)
+
+        
+        # Join all experts together
+
+        for gpu_idx, experts in enumerate(_output):
+            for expert_idx, expert_tokens in enumerate(experts):
+                if expert_tokens.size(dim=0) != 0:
+                    _output[gpu_idx][expert_idx] = self.experts[f"expert_{i}"].forward(expert_tokens)
+
+
+        # Send result to everyone
+        dist.all_to_all(input_tensors, _output)
+
+        for experts in input_tensors:
+            for idx, expert_res in enumerate(experts):
+                if expert_res.size(dim=0) != 0:
+                    next_states[router_mask[:,:,idx]] = expert_res
+        # Need a way to know the portions
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
+
+
+
+            # The old
+        #for expert_idx, (start, stop), output in outputs:
+        #    next_states[router_mask[:,:,expert_idx]][start:stop,:] = output
+        # result = torch.zeros_like(_input)
 
 class SwitchTransformersLayerFF(nn.Module):
     r"""
@@ -1995,15 +2111,14 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
         encoder_config.is_encoder_decoder = False
         self.encoder = SwitchTransformersStack(encoder_config, self.shared)
 
-        self.num_gpus = config.num_gpus
-        if self.num_gpus > 0:
-            self.encoder = self.encoder.to("cuda:0")
-
         # Initialize weights and apply final processing
         self.post_init()
 
         # Model parallel
         self.device_map = None
+
+    def expert_parallelise(self):
+        self.encoder.expert_parallelise()
     
     def expert_save_latencies(self, DIR=""):
         self.encoder.expert_save_latencies(DIR=DIR)
@@ -2061,15 +2176,15 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
         ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if self.num_gpus > 0:
-            if input_ids is not None:
-                input_ids = input_ids.to("cuda:0")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to("cuda:0")
-            if inputs_embeds is not None:
-                inputs_embeds = inputs_embeds.to("cuda:0")
-            if head_mask is not None:
-                head_mask = head_mask.to("cuda:0")
+        # if self.num_gpus > 0:
+        #     if input_ids is not None:
+        #         input_ids = input_ids.to("cuda:0")
+        #     if attention_mask is not None:
+        #         attention_mask = attention_mask.to("cuda:0")
+        #     if inputs_embeds is not None:
+        #         inputs_embeds = inputs_embeds.to("cuda:0")
+        #     if head_mask is not None:
+        #         head_mask = head_mask.to("cuda:0")
 
         encoder_outputs = self.encoder(
             input_ids=input_ids,
