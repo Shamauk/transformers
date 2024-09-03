@@ -327,12 +327,21 @@ class SwitchTransformersSparseMLP(nn.Module):
 
     
     def schedule_naive(self, hidden_states, router_mask):
-        experts = [2, 4, 6, 0, 3, 5, 7, 1]
-        gpus = [1, 2, 3, 0, 1, 2, 3, 0]
-        inputs = [hidden_states[router_mask[:,:,idx]] for idx in experts]
-        portions = [(0,_input.shape[0]) for _input in inputs]
+        expert_gpu = [[0,1], [2,3], [4,5], [6,7]]
+        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+        for i in range(self.num_gpus):
+            for j in expert_gpu[i]:
+                tokens = hidden_states[router_mask[:,:,j]]
+                schedule[i][j] = (0,tokens.shape[0],tokens)
+        return schedule
 
-        return (experts, gpus, inputs, portions)
+
+        # experts = [2, 4, 6, 0, 3, 5, 7, 1]
+        # gpus = [1, 2, 3, 0, 1, 2, 3, 0]
+        # inputs = [hidden_states[router_mask[:,:,idx]] for idx in experts]
+        # portions = [(0,_input.shape[0]) for _input in inputs]
+
+        # return (experts, gpus, inputs, portions)
     
     def schedule_adnexus(self, hidden_states, router_mask):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
@@ -470,70 +479,200 @@ class SwitchTransformersSparseMLP(nn.Module):
         next_states = hidden_states.clone()
         router_mask = router_mask.bool()
         
-        experts, gpus, inputs, portions = self.scheduler(hidden_states, router_mask)
+        schedule = self.scheduler(hidden_states, router_mask)
 
-        gpu_experts = [[] for _ in range(self.num_gpus)]
+        metadata_send = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
+        metadata_recv = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
 
-        # Build my data structure
-        for i in range(len(experts)):
-            gpu_experts[gpus[i]].append((experts[i], portions[i], inputs[i]))
+        tokens_send = [torch.zeros((0, self.config.d_model), device="cuda") for _ in range(self.num_gpus)]
 
-        # Find the max sends to a single gpu
-        _max = max(map(lambda x: len(x), gpu_experts))
-        max_metadata_size = 1 + (2 * self.num_experts) # Max work a gpu does it num_experts, since tokens are grouped by experts
-        _in = []
         for i in range(self.num_gpus):
-            metadata = torch.zeros(max_metadata_size, dtype=torch.int, device="cuda")
-            metadata[0] = _max
-            for j in range(len(gpu_experts[i])):
-                metadata[j*2 + 1] = gpu_experts[i][j][0]
-                metadata[(j+1)*2] = gpu_experts[i][j][2].size(0)
-            _in.append(metadata)
+            for j, d in enumerate(schedule[i]):
+                if d is None:
+                    continue
+                tokens = d[2]
+                metadata_send[i][j] = tokens.shape[0]
+                tokens_send[i] = torch.cat((tokens_send[i], tokens), dim=0)
+
+
+        # print(metadata_send)
+        # exit(1)
+
+        # Metadata all_to_all
+        dist.all_to_all(metadata_recv, metadata_send)
+
+        # print(metadata_recv)
+        # exit(1)
+
+        tokens_recv = [torch.empty((torch.sum(metadata_recv[i]),self.config.d_model), device="cuda") for i in range(self.num_gpus)]
+
+        # print(tokens_recv)
+        # exit(1)
+
+        # First data all_to_all
+        dist.all_to_all(tokens_recv, tokens_send)
+
+        for i in range(self.num_gpus):
+            start = 0
+            end = 0
+            for j in range(self.num_experts):
+                size = metadata_recv[i][j].item()
+                if size == 0:
+                    continue
+                end += size
+                tokens_recv[i][start:end] = self.experts[f"expert_{j}"].forward(tokens_recv[i][start:end])
+                start = end 
+
+        # print("finished doing work")
+        # exit(1)
         
-        metadata = [torch.zeros(max_metadata_size, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
-        dist.all_to_all(metadata, _in)
+        # Second data all_to_all to return tokens
+        dist.all_to_all(tokens_send, tokens_recv)
 
-        max_num_rounds = max(map(lambda x: x[0], metadata)).item()
-
-        for r in range(max_num_rounds):            
-            work_send = []
-            for i in range(self.num_gpus):
-                if r < len(gpu_experts[i]):
-                    t = gpu_experts[i][r][2]
-                else:
-                    t = torch.empty((0,self.config.d_model), device="cuda")
-                work_send.append(t)
-
-            work_receive = []
-            for i in range(self.num_gpus):
-                work_receive.append(torch.empty((metadata[i][(r+1)*2].item(), self.config.d_model), device="cuda"))
-
-            torch.cuda.nvtx.range_push(f"Sending data")
-            dist.all_to_all(work_receive, work_send)
-            torch.cuda.nvtx.range_pop()
-
-            torch.cuda.nvtx.range_push(f"Working")
-            for i in range(self.num_gpus):
-                if work_receive[i].size(dim=0) != 0:
-                    torch.cuda.nvtx.range_push(f"Work from {i}")
-                    work_receive[i] = self.experts[f"expert_{metadata[i][r*2 + 1]}"].forward(work_receive[i])
-                    torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_pop()
-            
-            # Send back
-            torch.cuda.nvtx.range_push(f"Sending results")
-            dist.all_to_all(work_send, work_receive)
-            torch.cuda.nvtx.range_pop()
-
-            # Update results 
-            torch.cuda.nvtx.range_push(f"Updating results")
-            for i in range(self.num_gpus):
-                if work_send[i].size(dim=0) != 0:
-                    next_states[router_mask[:,:,gpu_experts[i][r][0]]][gpu_experts[i][r][1][0]:gpu_experts[i][r][1][1],:] = work_send[i]
-            torch.cuda.nvtx.range_pop()
+        for i in range(self.num_gpus):
+            start = 0
+            end = 0
+            for j in range(self.num_experts):
+                size = metadata_send[i][j].item()
+                if size == 0:
+                    continue
+                end += size
+        
+                next_states[router_mask[:,:,j]][schedule[i][j][0]:schedule[i][j][1],:] = tokens_send[i][start:end,:]
+                start = end           
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
+
+
+    # @torch.no_grad()
+    # def forward(self, hidden_states):
+    #     router_mask, router_probs, router_logits = self.router(hidden_states)
+    #     expert_index = torch.argmax(router_mask, dim=-1)
+    #     next_states = hidden_states.clone()
+    #     router_mask = router_mask.bool()
+        
+    #     experts, gpus, inputs, portions = self.scheduler(hidden_states, router_mask)
+
+    #     gpu_experts = [[] for _ in range(self.num_gpus)]
+
+    #     # Build my data structure
+    #     for i in range(len(experts)):
+    #         gpu_experts[gpus[i]].append((experts[i], portions[i], inputs[i]))
+
+    #     # Find the max sends to a single gpu
+    #     _max = max(map(lambda x: len(x), gpu_experts))
+    #     max_metadata_size = 1 + (2 * self.num_experts) # Max work a gpu does it num_experts, since tokens are grouped by experts
+    #     _in = []
+    #     for i in range(self.num_gpus):
+    #         metadata = torch.zeros(max_metadata_size, dtype=torch.int, device="cuda")
+    #         metadata[0] = _max
+    #         for j in range(len(gpu_experts[i])):
+    #             metadata[j*2 + 1] = gpu_experts[i][j][0]
+    #             metadata[(j+1)*2] = gpu_experts[i][j][2].size(0)
+    #         _in.append(metadata)
+        
+    #     metadata = [torch.zeros(max_metadata_size, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
+    #     dist.all_to_all(metadata, _in)
+
+    #     max_num_rounds = max(map(lambda x: x[0], metadata)).item()
+
+    #     comm_stream = torch.cuda.Stream()
+    #     comp_stream = torch.cuda.Stream()
+    #     send_data_events = [torch.cuda.Event(blocking=False) for _ in range(max_num_rounds)]
+    #     finished_working_events = [torch.cuda.Event(blocking=False) for _ in range(max_num_rounds)]
+    #     finished_returning_events = [torch.cuda.Event(blocking=False) for _ in range(max_num_rounds)]
+
+    #     work_receive = [[] for _ in range(max_num_rounds)]
+    #     work_send = [[] for _ in range(max_num_rounds)]
+    #     for r in range(max_num_rounds+1):
+    #         if r != max_num_rounds:
+    #             with torch.cuda.stream(comm_stream):            
+    #                 for i in range(self.num_gpus):
+    #                     if r < len(gpu_experts[i]):
+    #                         t = gpu_experts[i][r][2]
+    #                     else:
+    #                         t = torch.empty((0,self.config.d_model), device="cuda")
+    #                     work_send[r].append(t)
+
+    #                 for i in range(self.num_gpus):
+    #                     work_receive[r].append(torch.empty((metadata[i][(r+1)*2].item(), self.config.d_model), device="cuda"))
+
+    #                 torch.cuda.nvtx.range_push(f"Sending data")
+    #                 dist.all_to_all(work_receive[r], work_send[r], async_op=True)
+    #                 send_data_events[r].record()
+    #                 torch.cuda.nvtx.range_pop()
+
+    #         if r == 0:
+    #             continue # We want a little backlog
+
+    #         with torch.cuda.stream(comp_stream):
+    #             torch.cuda.nvtx.range_push(f"Working")
+    #             send_data_events[r-1].wait()
+    #             for i in range(self.num_gpus):
+    #                 if work_receive[r-1][i].size(dim=0) != 0:
+    #                     torch.cuda.nvtx.range_push(f"Work from {i}")
+    #                     work_receive[r-1][i] = self.experts[f"expert_{metadata[i][r*2 + 1]}"].forward(work_receive[r-1][i])
+    #                     finished_working_events[r-1].record()
+    #                     torch.cuda.nvtx.range_pop()
+    #             torch.cuda.nvtx.range_pop()
+            
+    #         # Send back
+    #         with torch.cuda.stream(comm_stream):
+    #             finished_working_events[r-1].wait()
+    #             torch.cuda.nvtx.range_push(f"Sending results")
+    #             dist.all_to_all(work_send[r-1], work_receive[r-1], async_op=True)
+    #             torch.cuda.nvtx.range_pop()
+
+    #             finished_returning_events[r-1].record()
+    #             finished_returning_events[r-1].wait()
+
+    #             # Update results 
+    #             torch.cuda.nvtx.range_push(f"Updating results")
+    #             for i in range(self.num_gpus):
+    #                 if work_send[r-1][i].size(dim=0) != 0:
+    #                     next_states[router_mask[:,:,gpu_experts[i][r-1][0]]][gpu_experts[i][r-1][1][0]:gpu_experts[i][r-1][1][1],:] = work_send[r-1][i]
+    #             torch.cuda.nvtx.range_pop()
+
+    #     # for r in range(max_num_rounds):            
+    #     #     work_send = []
+    #     #     for i in range(self.num_gpus):
+    #     #         if r < len(gpu_experts[i]):
+    #     #             t = gpu_experts[i][r][2]
+    #     #         else:
+    #     #             t = torch.empty((0,self.config.d_model), device="cuda")
+    #     #         work_send.append(t)
+
+    #     #     work_receive = []
+    #     #     for i in range(self.num_gpus):
+    #     #         work_receive.append(torch.empty((metadata[i][(r+1)*2].item(), self.config.d_model), device="cuda"))
+
+    #     #     torch.cuda.nvtx.range_push(f"Sending data")
+    #     #     dist.all_to_all(work_receive, work_send)
+    #     #     torch.cuda.nvtx.range_pop()
+
+    #     #     torch.cuda.nvtx.range_push(f"Working")
+    #     #     for i in range(self.num_gpus):
+    #     #         if work_receive[i].size(dim=0) != 0:
+    #     #             torch.cuda.nvtx.range_push(f"Work from {i}")
+    #     #             work_receive[i] = self.experts[f"expert_{metadata[i][r*2 + 1]}"].forward(work_receive[i])
+    #     #             torch.cuda.nvtx.range_pop()
+    #     #     torch.cuda.nvtx.range_pop()
+            
+    #     #     # Send back
+    #     #     torch.cuda.nvtx.range_push(f"Sending results")
+    #     #     dist.all_to_all(work_send, work_receive)
+    #     #     torch.cuda.nvtx.range_pop()
+
+    #     #     # Update results 
+    #     #     torch.cuda.nvtx.range_push(f"Updating results")
+    #     #     for i in range(self.num_gpus):
+    #     #         if work_send[i].size(dim=0) != 0:
+    #     #             next_states[router_mask[:,:,gpu_experts[i][r][0]]][gpu_experts[i][r][1][0]:gpu_experts[i][r][1][1],:] = work_send[i]
+    #     #     torch.cuda.nvtx.range_pop()
+
+    #     hidden_states = router_probs * next_states
+    #     return hidden_states, (router_logits, expert_index)
 
 class SwitchTransformersLayerFF(nn.Module):
     r"""
