@@ -289,7 +289,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         for idx in range(self.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config)
         
-        self.scheduler = self.schedule_adnexus
+        self.scheduler = self.schedule_naive
 
 
         
@@ -363,10 +363,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         avg = int(sum(cur_num_tokens) / self.num_gpus)
         cutoff = int(avg * 1.15) # TODO change magic number to empirical value
 
-        # print(cur_gpu_assignment)
-        # print(cur_num_tokens)
-        # print(avg)
-
         for i in range(self.num_gpus):
             while cur_num_tokens[i] > cutoff:
                 # Find minimum
@@ -397,9 +393,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 # Between how much we can reduce thus far and the amount we can add to minimal gpu
                 tokens_to_spread = min(tokens_to_spread, avg - cur_num_tokens[min_idx])
 
-                # print(tokens_to_spread)
-                # exit(1)
-
 
                 # Update assignment
                 cur_gpu_assignment[i][max_expert] -= tokens_to_spread
@@ -407,9 +400,6 @@ class SwitchTransformersSparseMLP(nn.Module):
 
                 cur_num_tokens[i] -= tokens_to_spread
                 cur_num_tokens[min_idx] += tokens_to_spread
-
-        # print(cur_gpu_assignment)
-        # exit(1)
 
         # Build up schedule
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
@@ -548,7 +538,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         # First data all_to_all
         dist.all_to_all(tokens_recv, tokens_send)
 
-        # OPTION 1: minimize number of kernel launches
         # Collect tokens for each expert
         tokens_comp = [torch.empty((0, self.config.d_model), device="cuda") for _ in range(self.num_experts)]
         metadata_comp = [[(0, (0,0)) for _ in range(self.num_gpus)] for _ in range(self.num_experts)]
@@ -580,20 +569,12 @@ class SwitchTransformersSparseMLP(nn.Module):
             else:
                 expert_order.append(j)
 
-        # expert_order = list(range(self.num_experts))
-        # for j in self.loaded_experts:
-        #     expert_order.remove(j)
-        #     expert_order.insert(0, j)
-
-
         for idx, j in enumerate(expert_order):
-            # print(f"(rank:{self.rank}) Working on expert: {j}")
             self.expert_loaded_events[j].synchronize()
             tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
 
             with torch.cuda.stream(self.expert_offload_stream):
                 if idx+2 < num_experts_work:
-                    # print(f"(rank:{self.rank}) Loading the subsequent expert: {expert_order[idx+2]}")
                     # Load that expert ahead of time
                     self.experts[f"expert_{j}"].cpu()
                     self.experts[f"expert_{expert_order[idx+2]}"].cuda()
@@ -617,25 +598,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                     self.is_expert_loaded[j] = True
 
 
-        # print(f"(rank:{self.rank}) finished fwd pass")
-
-            # if j not in self.loaded_experts:
-            #     self.experts[f"expert_{self.loaded_experts[0]}"].cpu()
-            #     self.experts[f"expert_{j}"].cuda()
-
-            # tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
-
-            # if j not in self.loaded_experts:
-            #     self.experts[f"expert_{j}"].cpu()
-            #     self.experts[f"expert_{self.loaded_experts[0]}"].cuda()
-
-        # for j in range(self.num_experts):
-        #     if tokens_comp[j].size(dim=0) != 0:
-        #         tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
-
-
-
-
         # Distribute tokens back
         for j in range(self.num_experts):
             start = 0
@@ -650,19 +612,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 start = end
 
 
-        # OPTION 2: Launch expert for each expert request (no grouping)
-        # for i in range(self.num_gpus):
-        #     start = 0
-        #     end = 0
-        #     for j in range(self.num_experts):
-        #         size = metadata_recv[i][j].item()
-        #         if size == 0:
-        #             continue
-        #         end += size
-        #         tokens_recv[i][start:end] = self.experts[f"expert_{j}"].forward(tokens_recv[i][start:end])
-        #         start = end 
-
-        
         # Second data all_to_all to return tokens
         dist.all_to_all(tokens_send, tokens_recv)
 
