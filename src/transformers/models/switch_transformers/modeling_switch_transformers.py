@@ -504,7 +504,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         # First data all_to_all
         dist.all_to_all(tokens_recv, tokens_send)
 
-
+        # OPTION 1: minimize number of kernel launches
         # Collect tokens for each expert
         tokens_comp = [torch.empty((0, self.config.d_model), device="cuda") for _ in range(self.num_experts)]
         metadata_comp = [[(0, (0,0)) for _ in range(self.num_gpus)] for _ in range(self.num_experts)]
@@ -540,6 +540,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                 start = end
 
 
+        # OPTION 2: Launch expert for each expert request (no grouping)
         # for i in range(self.num_gpus):
         #     start = 0
         #     end = 0
