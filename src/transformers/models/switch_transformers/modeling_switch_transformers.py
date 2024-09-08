@@ -274,6 +274,13 @@ class SwitchTransformersSparseMLP(nn.Module):
         # self.gpu_idx_and_offset_to_expert = [[] for _ in range(self.num_gpus)]
         # self.gpu_idx_and_offset_to_expert[self.num_gpus-1] = list(range(self.num_experts))
 
+        self.is_expert_loaded = [False for _ in range(self.num_experts)]
+        self.original_loaded_experts = []
+
+        self.expert_offload_stream = torch.cuda.Stream()
+        self.expert_loaded_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
+
+
         # Step 1: Get the correct router according to its class
         self.router = SwitchTransformersTop1Router(config)
 
@@ -283,6 +290,8 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.experts[f"expert_{idx}"] = expert_class(config)
         
         self.scheduler = self.schedule_adnexus
+
+
         
     def expert_parallelise(self):
         # TODO maybe have some way of specifying initial setup
@@ -292,6 +301,8 @@ class SwitchTransformersSparseMLP(nn.Module):
         end = (self.rank+1) * num_experts_per_gpu
         for i in range(start, end):
             self.experts[f"expert_{i}"].cuda()
+            self.is_expert_loaded[i] = True
+            self.original_loaded_experts.append(i)
        
 
     def expert_save_latencies(self, DIR=""):
@@ -415,52 +426,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 start = end 
                 
         return schedule 
-
-
-        # print(cur_gpu_assignment)
-        # print(cur_num_tokens)
-        # print(avg)
-        # exit(1)
-
-
-        # expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        # experts_to_schedule = [(idx, expert_inputs[idx].shape[0]) for idx in range(self.num_experts)]
-        # gpu_assignment = [[] for _ in range(self.num_gpus)]
-        # cur_gpu_num_tokens = [0 for _ in range(self.num_gpus)]
-        # experts_to_schedule.sort(reverse=True, key=lambda x: x[1])
-
-
-        # while len(experts_to_schedule) != 0:
-        #     target_idx = 0
-        #     target_value = cur_gpu_num_tokens[0]
-        #     for idx in range(1, self.num_gpus):
-        #         if cur_gpu_num_tokens[idx] < target_value:
-        #             target_idx = idx
-        #             target_value = cur_gpu_num_tokens[idx]
-            
-        #     expert_idx, num_toks = experts_to_schedule.pop(0)
-        #     cur_gpu_num_tokens[target_idx] += num_toks
-        #     gpu_assignment[target_idx].append(expert_idx)
-        
-        # experts = []
-        # gpus = []
-        # inputs = []
-        # portions = []
-
-        # num_experts_allocated = 0
-        # col = 0
-        # while num_experts_allocated != self.num_experts:
-        #     for idx in list(range(1, self.num_gpus)) + [0]:
-        #         if col < len(gpu_assignment[idx]):
-        #             expert_idx = gpu_assignment[idx][col]
-        #             experts.append(expert_idx)
-        #             gpus.append(idx)
-        #             inputs.append(expert_inputs[expert_idx])
-        #             portions.append((0, expert_inputs[expert_idx].shape[0]))
-        #             num_experts_allocated += 1
-        #     col += 1
-
-        # return (experts, gpus, inputs, portions)
 
     # Here we will start with my 1.15 overflow to a GPU with the least
     # For now let us not overflow but a single expert across all ranks
@@ -601,9 +566,75 @@ class SwitchTransformersSparseMLP(nn.Module):
                 start = end
 
         # Do computation
+        # Start with the ones loaded
+        expert_order = []
+        num_experts_work = 0
         for j in range(self.num_experts):
-            if tokens_comp[j].size(dim=0) != 0:
-                tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
+            if tokens_comp[j].size(dim=0) == 0:
+                continue
+
+            num_experts_work += 1
+            if self.is_expert_loaded[j]:
+                expert_order.insert(0, j)
+                self.expert_loaded_events[j].record()
+            else:
+                expert_order.append(j)
+
+        # expert_order = list(range(self.num_experts))
+        # for j in self.loaded_experts:
+        #     expert_order.remove(j)
+        #     expert_order.insert(0, j)
+
+
+        for idx, j in enumerate(expert_order):
+            # print(f"(rank:{self.rank}) Working on expert: {j}")
+            self.expert_loaded_events[j].synchronize()
+            tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
+
+            with torch.cuda.stream(self.expert_offload_stream):
+                if idx+2 < num_experts_work:
+                    # print(f"(rank:{self.rank}) Loading the subsequent expert: {expert_order[idx+2]}")
+                    # Load that expert ahead of time
+                    self.experts[f"expert_{j}"].cpu()
+                    self.experts[f"expert_{expert_order[idx+2]}"].cuda()
+                    self.is_expert_loaded[j] = False
+                    self.is_expert_loaded[expert_order[idx+2]] = True 
+                    self.expert_loaded_events[expert_order[idx+2]].record()
+            
+
+        # Let us add back the original experts
+        # By the time we come back to this layer it will
+        # almost certainly be loaded already (so no need to syncrhonize)
+        with torch.cuda.stream(self.expert_offload_stream):
+            for j in range(self.num_experts):
+                if self.is_expert_loaded[j] and j not in self.original_loaded_experts:
+                    self.experts[f"expert_{j}"].cpu()
+                    self.is_expert_loaded[j] = False
+            
+            for j in self.original_loaded_experts:
+                if not self.is_expert_loaded[j]:
+                    self.experts[f"expert_{j}"].cuda()
+                    self.is_expert_loaded[j] = True
+
+
+        # print(f"(rank:{self.rank}) finished fwd pass")
+
+            # if j not in self.loaded_experts:
+            #     self.experts[f"expert_{self.loaded_experts[0]}"].cpu()
+            #     self.experts[f"expert_{j}"].cuda()
+
+            # tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
+
+            # if j not in self.loaded_experts:
+            #     self.experts[f"expert_{j}"].cpu()
+            #     self.experts[f"expert_{self.loaded_experts[0]}"].cuda()
+
+        # for j in range(self.num_experts):
+        #     if tokens_comp[j].size(dim=0) != 0:
+        #         tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
+
+
+
 
         # Distribute tokens back
         for j in range(self.num_experts):
