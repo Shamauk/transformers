@@ -282,9 +282,10 @@ class SwitchTransformersSparseMLP(nn.Module):
         for idx in range(self.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config)
         
-        self.scheduler = self.schedule_naive
+        self.scheduler = self.schedule_adnexus
         
     def expert_parallelise(self):
+        # TODO maybe have some way of specifying initial setup
         # Do a naive for now 
         num_experts_per_gpu = self.num_experts // self.num_gpus
         start = self.rank * num_experts_per_gpu
@@ -325,7 +326,11 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         #         writer.writerow(dic)
 
-    
+    # FOR SCHEDULING
+    # You are to return an array with entry for each gpu for which each entry
+    # has a tuple or None value for each expert. The tuple comprises of
+    # (start,end,tokens)
+
     def schedule_naive(self, hidden_states, router_mask):
         expert_gpu = [[0,1], [2,3], [4,5], [6,7]]
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
@@ -334,54 +339,128 @@ class SwitchTransformersSparseMLP(nn.Module):
                 tokens = hidden_states[router_mask[:,:,j]]
                 schedule[i][j] = (0,tokens.shape[0],tokens)
         return schedule
-
-
-        # experts = [2, 4, 6, 0, 3, 5, 7, 1]
-        # gpus = [1, 2, 3, 0, 1, 2, 3, 0]
-        # inputs = [hidden_states[router_mask[:,:,idx]] for idx in experts]
-        # portions = [(0,_input.shape[0]) for _input in inputs]
-
-        # return (experts, gpus, inputs, portions)
     
     def schedule_adnexus(self, hidden_states, router_mask):
+        expert_gpu = [[0,1], [2,3], [4,5], [6,7]] # TODO maybe there is a better initialisation
+
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        experts_to_schedule = [(idx, expert_inputs[idx].shape[0]) for idx in range(self.num_experts)]
-        gpu_assignment = [[] for _ in range(self.num_gpus)]
-        cur_gpu_num_tokens = [0 for _ in range(self.num_gpus)]
-        experts_to_schedule.sort(reverse=True, key=lambda x: x[1])
+        cur_gpu_assignment = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+        for i, experts in enumerate(expert_gpu):
+            for expert in experts:
+                cur_gpu_assignment[i][expert] = expert_inputs[expert].size(dim=0)
+        cur_num_tokens = list(map(lambda arr: sum(arr), cur_gpu_assignment))
+        avg = int(sum(cur_num_tokens) / self.num_gpus)
+        cutoff = int(avg * 1.15) # TODO change magic number to empirical value
+
+        # print(cur_gpu_assignment)
+        # print(cur_num_tokens)
+        # print(avg)
+
+        for i in range(self.num_gpus):
+            while cur_num_tokens[i] > cutoff:
+                # Find minimum
+                _min = cur_num_tokens[0]
+                min_idx = 0
+                for j in range(self.num_gpus):
+                    if cur_num_tokens[j] < _min:
+                        _min = cur_num_tokens[j]
+                        min_idx = j
+                
+                # Check if suitable place to move tokens
+                if min_idx == i:
+                    break
+                if _min > avg:
+                    break
+
+                # Get the maximal expert to move
+                _max = -1
+                max_expert = -1
+                for idx, size in enumerate(cur_gpu_assignment[i]):
+                    if size > _max:
+                        _max = size
+                        max_expert = idx
+
+                # Find maximal tokens that can be sent
+                # Between how much we want to reduce and the amount the maximal expert has 
+                tokens_to_spread = min(_max, cur_num_tokens[i] - cutoff)
+                # Between how much we can reduce thus far and the amount we can add to minimal gpu
+                tokens_to_spread = min(tokens_to_spread, avg - cur_num_tokens[min_idx])
+
+                # print(tokens_to_spread)
+                # exit(1)
 
 
-        while len(experts_to_schedule) != 0:
-            target_idx = 0
-            target_value = cur_gpu_num_tokens[0]
-            for idx in range(1, self.num_gpus):
-                if cur_gpu_num_tokens[idx] < target_value:
-                    target_idx = idx
-                    target_value = cur_gpu_num_tokens[idx]
+                # Update assignment
+                cur_gpu_assignment[i][max_expert] -= tokens_to_spread
+                cur_gpu_assignment[min_idx][max_expert] += tokens_to_spread
+
+                cur_num_tokens[i] -= tokens_to_spread
+                cur_num_tokens[min_idx] += tokens_to_spread
+
+        # print(cur_gpu_assignment)
+        # exit(1)
+
+        # Build up schedule
+        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+        for j in range(self.num_experts):
+            start = 0
+            end = 0
+            for i in range(self.num_gpus):
+                if cur_gpu_assignment[i][j] == 0:
+                    continue
+                size = cur_gpu_assignment[i][j]
+                end += size
+                schedule[i][j] = (start, end, expert_inputs[j][start:end])
+                start = end 
+                
+        return schedule 
+
+
+        # print(cur_gpu_assignment)
+        # print(cur_num_tokens)
+        # print(avg)
+        # exit(1)
+
+
+        # expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
+        # experts_to_schedule = [(idx, expert_inputs[idx].shape[0]) for idx in range(self.num_experts)]
+        # gpu_assignment = [[] for _ in range(self.num_gpus)]
+        # cur_gpu_num_tokens = [0 for _ in range(self.num_gpus)]
+        # experts_to_schedule.sort(reverse=True, key=lambda x: x[1])
+
+
+        # while len(experts_to_schedule) != 0:
+        #     target_idx = 0
+        #     target_value = cur_gpu_num_tokens[0]
+        #     for idx in range(1, self.num_gpus):
+        #         if cur_gpu_num_tokens[idx] < target_value:
+        #             target_idx = idx
+        #             target_value = cur_gpu_num_tokens[idx]
             
-            expert_idx, num_toks = experts_to_schedule.pop(0)
-            cur_gpu_num_tokens[target_idx] += num_toks
-            gpu_assignment[target_idx].append(expert_idx)
+        #     expert_idx, num_toks = experts_to_schedule.pop(0)
+        #     cur_gpu_num_tokens[target_idx] += num_toks
+        #     gpu_assignment[target_idx].append(expert_idx)
         
-        experts = []
-        gpus = []
-        inputs = []
-        portions = []
+        # experts = []
+        # gpus = []
+        # inputs = []
+        # portions = []
 
-        num_experts_allocated = 0
-        col = 0
-        while num_experts_allocated != self.num_experts:
-            for idx in list(range(1, self.num_gpus)) + [0]:
-                if col < len(gpu_assignment[idx]):
-                    expert_idx = gpu_assignment[idx][col]
-                    experts.append(expert_idx)
-                    gpus.append(idx)
-                    inputs.append(expert_inputs[expert_idx])
-                    portions.append((0, expert_inputs[expert_idx].shape[0]))
-                    num_experts_allocated += 1
-            col += 1
+        # num_experts_allocated = 0
+        # col = 0
+        # while num_experts_allocated != self.num_experts:
+        #     for idx in list(range(1, self.num_gpus)) + [0]:
+        #         if col < len(gpu_assignment[idx]):
+        #             expert_idx = gpu_assignment[idx][col]
+        #             experts.append(expert_idx)
+        #             gpus.append(idx)
+        #             inputs.append(expert_inputs[expert_idx])
+        #             portions.append((0, expert_inputs[expert_idx].shape[0]))
+        #             num_experts_allocated += 1
+        #     col += 1
 
-        return (experts, gpus, inputs, portions)
+        # return (experts, gpus, inputs, portions)
 
     # Here we will start with my 1.15 overflow to a GPU with the least
     # For now let us not overflow but a single expert across all ranks
