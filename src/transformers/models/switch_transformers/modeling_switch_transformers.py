@@ -283,9 +283,17 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.experts = nn.ModuleDict()
         for idx in range(self.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config)
-        
-        self.scheduler = self.schedule_even_split
 
+        match self.config.scheduling_policy:
+            case "naive":
+                self.scheduler = self.schedule_naive
+            case "adnexus":
+                self.scheduler = self.schedule_adnexus
+            case "even_split":
+                self.scheduler = self.schedule_even_split
+            case _:
+                print("SCHEDULING POLICY NOT IMPLEMENTED")
+                exit(1)
 
         
     def expert_parallelise(self):
@@ -2061,9 +2069,11 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
 class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
     _tied_weights_keys = ["encoder.embed_tokens.weight"]
 
-    def __init__(self, config: SwitchTransformersConfig):
+    def __init__(self, config: SwitchTransformersConfig, scheduling_policy="naive"):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
+
+        config.scheduling_policy = scheduling_policy
 
         encoder_config = copy.deepcopy(config)
         encoder_config.use_cache = False
