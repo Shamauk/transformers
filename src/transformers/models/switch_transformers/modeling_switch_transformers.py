@@ -326,34 +326,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 writer.writerow(dic)
 
 
-            # fieldnames = ["total number of tokens", "iteration", "latency (ms)"]
-            # for i in range(self.num_experts):
-            #     fieldnames.append(f"expert_{i} num tokens")
-            # for i in range(self.num_gpus):
-            #     fieldnames.append(f"gpu:{i} num tokens")
-
-            # writer = csv.DictWriter(f, fieldnames=fieldnames)
-            # writer.writeheader()
-            # start_idx_of_cur = 0
-            # cur_tot_toks = 0
-            # for i in range(len(self.tot_num_tokens)):
-            #     if self.tot_num_tokens[i] != cur_tot_toks:
-            #         start_idx_of_cur = i 
-            #         cur_tot_toks = self.tot_num_tokens[i]
-
-            #     dic = {
-            #         "total number of tokens": self.tot_num_tokens[i],
-            #         "iteration": i - start_idx_of_cur,
-            #         "latency (ms)": self.forward_latencies[i]
-            #     }
-            #     for j in range(self.num_experts):
-            #         dic[f"expert_{j} num tokens"] = self.num_token_each_expert[j][i]
-
-            #     for j in range(self.num_gpus):
-            #         dic[f"gpu:{j} num tokens"] = self.num_token_each_gpu[j][i]
-                       
-            #     writer.writerow(dic)
-
     # FOR SCHEDULING
     # You are to return an array with entry for each gpu for which each entry
     # has a tuple or None value for each expert. The tuple comprises of
