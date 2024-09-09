@@ -426,50 +426,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         
         return schedule 
 
-
-
-
-
-
-        # experts = []
-        # gpus = []
-        # inputs = []
-        # portions = []
-
-        # for i in range(self.num_experts):
-        #     _in = hidden_states[router_mask[:,:,i]]
-        #     _len = _in.shape[0]
-        #     _len_per_gpu = _len // self.num_gpus
-        #     p = [_len_per_gpu for _ in range(self.num_gpus)]
-        #     leftover = _len - _len_per_gpu * self.num_gpus
-        #     i = 0
-        #     while leftover > 0:
-        #         p[i] += 1
-        #         i += 1
-        #         leftover -= 1
-            
-        #     start = 0
-        #     for j in range(self.num_gpus):
-        #         end = start + p[j]
-
-        #         experts.append(i)
-        #         gpus.append(j)
-        #         inputs.append(_in[start:end])
-        #         portions.append((start, end))
-
-        #         start = end
-
-        # for i in range(len(experts)):
-        #     print("##############")
-        #     print(f"Expert: {experts[i]}")
-        #     print(f"Gpu: {gpus[i]}")
-        #     print(f"Input size: {inputs[i].shape[0]}")
-        #     print(f"Start: {portions[i][0]} End: {portions[i][1]}")
-        #     print(f"Portion length: {portions[i][1] - portions[i][0]}")
-
-        # return (experts, gpus, inputs, portions)
-
-
     @torch.no_grad()
     def forward(self, hidden_states):
         router_mask, router_probs, router_logits = self.router(hidden_states)
