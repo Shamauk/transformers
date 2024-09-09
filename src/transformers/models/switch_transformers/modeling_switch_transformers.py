@@ -264,15 +264,10 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.rank = dist.get_rank()
         self.config = config
 
-        # self.latencies = [[] for i in range(self.num_gpus)]
-        # self.forward_latencies = []
-        # self.tot_num_tokens = []
-        # self.num_token_each_expert = [[] for _ in range(self.num_experts)]
-        # self.num_token_each_gpu = [[] for _ in range(self.num_gpus)]
-
-        # self.expert_to_gpu_idx = [-1 for _ in range(self.num_experts)]
-        # self.gpu_idx_and_offset_to_expert = [[] for _ in range(self.num_gpus)]
-        # self.gpu_idx_and_offset_to_expert[self.num_gpus-1] = list(range(self.num_experts))
+        self.tot_num_tokens = []
+        self.num_token_each_expert = [[] for _ in range(self.num_experts)]
+        self.num_token_each_gpu = [[] for _ in range(self.num_gpus)]
+        self.num_token_comp = []
 
         self.is_expert_loaded = [False for _ in range(self.num_experts)]
         self.original_loaded_experts = []
@@ -289,7 +284,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         for idx in range(self.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config)
         
-        self.scheduler = self.schedule_naive
+        self.scheduler = self.schedule_adnexus
 
 
         
@@ -306,36 +301,58 @@ class SwitchTransformersSparseMLP(nn.Module):
        
 
     def expert_save_latencies(self, DIR=""):
-        pass
-        # with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
-        #     fieldnames = ["total number of tokens", "iteration", "latency (ms)"]
-        #     for i in range(self.num_experts):
-        #         fieldnames.append(f"expert_{i} num tokens")
-        #     for i in range(self.num_gpus):
-        #         fieldnames.append(f"gpu:{i} num tokens")
+        with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
+            fieldnames = ["iteration", "total number of tokens"]
+            for j in range(self.num_experts):
+                fieldnames.append(f"expert_{j} num tokens")
+            for i in range(self.num_gpus):
+                fieldnames.append(f"gpu:{i} num tokens")
+            fieldnames.append(f"gpu:{torch.cuda.current_device()} comp num tokens")
 
-        #     writer = csv.DictWriter(f, fieldnames=fieldnames)
-        #     writer.writeheader()
-        #     start_idx_of_cur = 0
-        #     cur_tot_toks = 0
-        #     for i in range(len(self.tot_num_tokens)):
-        #         if self.tot_num_tokens[i] != cur_tot_toks:
-        #             start_idx_of_cur = i 
-        #             cur_tot_toks = self.tot_num_tokens[i]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
 
-        #         dic = {
-        #             "total number of tokens": self.tot_num_tokens[i],
-        #             "iteration": i - start_idx_of_cur,
-        #             "latency (ms)": self.forward_latencies[i]
-        #         }
-        #         for j in range(self.num_experts):
-        #             dic[f"expert_{j} num tokens"] = self.num_token_each_expert[j][i]
+            for i in range(len(self.tot_num_tokens)):
+                dic = {
+                    "iteration": i,
+                    "total number of tokens": self.tot_num_tokens[i],
+                }
+                for j in range(self.num_experts):
+                    dic[f"expert_{j} num tokens"] = self.num_token_each_expert[j][i]
+                for j in range(self.num_gpus):
+                    dic[f"gpu:{j} num tokens"] = self.num_token_each_gpu[j][i]
+                dic[f"gpu:{torch.cuda.current_device()} comp num tokens"] = self.num_token_comp[i]
+                
+                writer.writerow(dic)
 
-        #         for j in range(self.num_gpus):
-        #             dic[f"gpu:{j} num tokens"] = self.num_token_each_gpu[j][i]
+
+            # fieldnames = ["total number of tokens", "iteration", "latency (ms)"]
+            # for i in range(self.num_experts):
+            #     fieldnames.append(f"expert_{i} num tokens")
+            # for i in range(self.num_gpus):
+            #     fieldnames.append(f"gpu:{i} num tokens")
+
+            # writer = csv.DictWriter(f, fieldnames=fieldnames)
+            # writer.writeheader()
+            # start_idx_of_cur = 0
+            # cur_tot_toks = 0
+            # for i in range(len(self.tot_num_tokens)):
+            #     if self.tot_num_tokens[i] != cur_tot_toks:
+            #         start_idx_of_cur = i 
+            #         cur_tot_toks = self.tot_num_tokens[i]
+
+            #     dic = {
+            #         "total number of tokens": self.tot_num_tokens[i],
+            #         "iteration": i - start_idx_of_cur,
+            #         "latency (ms)": self.forward_latencies[i]
+            #     }
+            #     for j in range(self.num_experts):
+            #         dic[f"expert_{j} num tokens"] = self.num_token_each_expert[j][i]
+
+            #     for j in range(self.num_gpus):
+            #         dic[f"gpu:{j} num tokens"] = self.num_token_each_gpu[j][i]
                        
-
-        #         writer.writerow(dic)
+            #     writer.writerow(dic)
 
     # FOR SCHEDULING
     # You are to return an array with entry for each gpu for which each entry
@@ -512,6 +529,11 @@ class SwitchTransformersSparseMLP(nn.Module):
         expert_index = torch.argmax(router_mask, dim=-1)
         next_states = hidden_states.clone()
         router_mask = router_mask.bool()
+
+        # Collect some stats
+        self.tot_num_tokens.append(hidden_states.shape[0]*hidden_states.shape[1])
+        for j in range(self.num_experts):
+            self.num_token_each_expert[j].append(hidden_states[router_mask[:,:,j]].shape[0])
         
         schedule = self.scheduler(hidden_states, router_mask)
 
@@ -527,16 +549,19 @@ class SwitchTransformersSparseMLP(nn.Module):
                 tokens = d[2]
                 metadata_send[i][j] = tokens.shape[0]
                 tokens_send[i] = torch.cat((tokens_send[i], tokens), dim=0)
+            self.num_token_each_gpu[i].append(tokens_send[i].shape[0])
 
 
         # Metadata all_to_all
         dist.all_to_all(metadata_recv, metadata_send)
 
         tokens_recv = [torch.empty((torch.sum(metadata_recv[i]),self.config.d_model), device="cuda") for i in range(self.num_gpus)]
+        self.num_token_comp.append(sum(list(torch.sum(metadata_recv[i]).item() for i in range(self.num_gpus))))
 
 
         # First data all_to_all
         dist.all_to_all(tokens_recv, tokens_send)
+
 
         # Collect tokens for each expert
         tokens_comp = [torch.empty((0, self.config.d_model), device="cuda") for _ in range(self.num_experts)]
