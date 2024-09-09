@@ -284,7 +284,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         for idx in range(self.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config)
         
-        self.scheduler = self.schedule_adnexus
+        self.scheduler = self.schedule_even_split
 
 
         
@@ -406,93 +406,68 @@ class SwitchTransformersSparseMLP(nn.Module):
                 
         return schedule 
 
-    # Here we will start with my 1.15 overflow to a GPU with the least
-    # For now let us not overflow but a single expert across all ranks
-    def schedule_demeter(self, hidden_states, router_mask):
-        experts_gpus = [[0, 1], [2, 3], [4, 5], [6, 7]]
-
-        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        experts_num_toks = [expert_inputs[idx].shape[0] for idx in range(self.num_experts)]
-        amt_tokens_each_gpu = [sum([experts_num_toks[i] for i in j]) for j in experts_gpus]
-        max_tokens_on_a_gpu = max(amt_tokens_each_gpu)
-        gpu_w_max_tokens = amt_tokens_each_gpu.index(max_tokens_on_a_gpu)
-        avg = sum(amt_tokens_each_gpu) / self.num_gpus
-        amount_to_redistribute = max_tokens_on_a_gpu - int(1.15 * avg)
-        amount_to_gpu = max_tokens_on_a_gpu - amount_to_redistribute
-        max_tokens_expert_in_gpu = max([experts_num_toks[idx] for idx in experts_gpus[gpu_w_max_tokens]])
-        max_expert_idx_in_gpu = experts_num_toks.index(max_tokens_expert_in_gpu)
-
-
-        # Will then add on the offloads
-        experts = [2, 4, 6, 0, 3, 5, 7, 1]
-        gpus = [1, 2, 3, 0, 1, 2, 3, 0]
-        inputs = [expert_inputs[idx] for idx in experts]
-        portions = [(0, experts_num_toks[idx]) for idx in experts]
-
-        # Update the offload
-        idx = experts.index(max_expert_idx_in_gpu)
-        inputs[idx] = inputs[idx][:amount_to_gpu]
-        portions[idx] = (0, amount_to_gpu)
-
-        # How do I want to move the extra around?
-        amt_tokens_each_gpu[gpu_w_max_tokens] = 0
-        s = sum(amt_tokens_each_gpu)
-        weights = [amt / s for amt in amt_tokens_each_gpu]
-        tokens_to_each = [math.floor(amount_to_redistribute * weight) for weight in weights]
-        m_idx = max(tokens_to_each)
-        tokens_to_each[tokens_to_each.index(m_idx)] += amount_to_redistribute - sum(tokens_to_each)
-
-        start = amount_to_gpu
-        for idx, amt in enumerate(tokens_to_each):
-            if amt == 0:
-                continue
-            end = start + amt
-            experts.append(max_expert_idx_in_gpu)
-            gpus.append(idx)
-            inputs.append(expert_inputs[max_expert_idx_in_gpu][start:end])
-            portions.append((start, end))
-            start = end
-
-        return (experts, gpus, inputs, portions)
-
     def schedule_even_split(self, hidden_states, router_mask):
-        experts = []
-        gpus = []
-        inputs = []
-        portions = []
+        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
+        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
-        for i in range(self.num_experts):
-            _in = hidden_states[router_mask[:,:,i]]
-            _len = _in.shape[0]
-            _len_per_gpu = _len // self.num_gpus
-            p = [_len_per_gpu for _ in range(self.num_gpus)]
-            leftover = _len - _len_per_gpu * self.num_gpus
-            i = 0
-            while leftover > 0:
-                p[i] += 1
-                i += 1
-                leftover -= 1
-            
+        for j in range(self.num_experts):
+            if expert_inputs[j].shape[0] == 0:
+                continue
+            avg = expert_inputs[j].shape[0] // self.num_gpus
+            mod = expert_inputs[j].shape[0] % self.num_gpus
             start = 0
-            for j in range(self.num_gpus):
-                end = start + p[j]
+            end = 0
+            for i in range(self.num_gpus):
+                end += avg 
+                if i == 0:
+                    end += mod
+                schedule[i][j] = (start,end,expert_inputs[j][start:end])
+                start = end 
+        
+        return schedule 
 
-                experts.append(i)
-                gpus.append(j)
-                inputs.append(_in[start:end])
-                portions.append((start, end))
 
-                start = end
 
-        for i in range(len(experts)):
-            print("##############")
-            print(f"Expert: {experts[i]}")
-            print(f"Gpu: {gpus[i]}")
-            print(f"Input size: {inputs[i].shape[0]}")
-            print(f"Start: {portions[i][0]} End: {portions[i][1]}")
-            print(f"Portion length: {portions[i][1] - portions[i][0]}")
 
-        return (experts, gpus, inputs, portions)
+
+
+        # experts = []
+        # gpus = []
+        # inputs = []
+        # portions = []
+
+        # for i in range(self.num_experts):
+        #     _in = hidden_states[router_mask[:,:,i]]
+        #     _len = _in.shape[0]
+        #     _len_per_gpu = _len // self.num_gpus
+        #     p = [_len_per_gpu for _ in range(self.num_gpus)]
+        #     leftover = _len - _len_per_gpu * self.num_gpus
+        #     i = 0
+        #     while leftover > 0:
+        #         p[i] += 1
+        #         i += 1
+        #         leftover -= 1
+            
+        #     start = 0
+        #     for j in range(self.num_gpus):
+        #         end = start + p[j]
+
+        #         experts.append(i)
+        #         gpus.append(j)
+        #         inputs.append(_in[start:end])
+        #         portions.append((start, end))
+
+        #         start = end
+
+        # for i in range(len(experts)):
+        #     print("##############")
+        #     print(f"Expert: {experts[i]}")
+        #     print(f"Gpu: {gpus[i]}")
+        #     print(f"Input size: {inputs[i].shape[0]}")
+        #     print(f"Start: {portions[i][0]} End: {portions[i][1]}")
+        #     print(f"Portion length: {portions[i][1] - portions[i][0]}")
+
+        # return (experts, gpus, inputs, portions)
 
 
     @torch.no_grad()
