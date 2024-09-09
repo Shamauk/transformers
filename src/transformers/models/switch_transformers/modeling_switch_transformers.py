@@ -264,10 +264,12 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.rank = dist.get_rank()
         self.config = config
 
-        self.tot_num_tokens = []
-        self.num_token_each_expert = [[] for _ in range(self.num_experts)]
-        self.num_token_each_gpu = [[] for _ in range(self.num_gpus)]
-        self.num_token_comp = []
+        self.tot_num_toks_send = []
+        self.num_toks_each_expert_send = [[] for _ in range(self.num_experts)]
+        self.num_toks_each_gpu_send = [[] for _ in range(self.num_gpus)]
+
+        self.tot_num_toks_recv = []
+        self.num_toks_each_expert_recv = [[] for _ in range(self.num_experts)]
 
         self.is_expert_loaded = [False for _ in range(self.num_experts)]
         self.original_loaded_experts = []
@@ -291,6 +293,8 @@ class SwitchTransformersSparseMLP(nn.Module):
                 self.scheduler = self.schedule_adnexus
             case "even_split":
                 self.scheduler = self.schedule_even_split
+            case "drop":
+                self.scheduler = self.schedule_drop
             case _:
                 print("SCHEDULING POLICY NOT IMPLEMENTED")
                 exit(1)
@@ -299,6 +303,15 @@ class SwitchTransformersSparseMLP(nn.Module):
     def expert_parallelise(self):
         # TODO maybe have some way of specifying initial setup
         # Do a naive for now 
+
+        # Temp to see if loading is the slow down
+        # for i in range(self.num_experts):
+        #     self.experts[f"expert_{i}"].cuda()
+        #     self.is_expert_loaded[i] = True
+        #     self.original_loaded_experts.append(i)
+        # return
+
+
         num_experts_per_gpu = self.num_experts // self.num_gpus
         start = self.rank * num_experts_per_gpu
         end = (self.rank+1) * num_experts_per_gpu
@@ -310,26 +323,27 @@ class SwitchTransformersSparseMLP(nn.Module):
 
     def expert_save_latencies(self, DIR=""):
         with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
-            fieldnames = ["iteration", "total number of tokens"]
+            fieldnames = ["iteration", "total number of tokens sent", "total number of tokens recv"]
             for j in range(self.num_experts):
-                fieldnames.append(f"expert_{j} num tokens")
+                fieldnames.append(f"expert_{j} num tokens sent")
+                fieldnames.append(f"expert_{j} num tokens recv")
             for i in range(self.num_gpus):
-                fieldnames.append(f"gpu:{i} num tokens")
-            fieldnames.append(f"gpu:{torch.cuda.current_device()} comp num tokens")
+                fieldnames.append(f"gpu:{i} num tokens sent")
 
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
-            for i in range(len(self.tot_num_tokens)):
+            for i in range(len(self.tot_num_toks_send)):
                 dic = {
                     "iteration": i,
-                    "total number of tokens": self.tot_num_tokens[i],
+                    "total number of tokens sent": self.tot_num_toks_send[i],
+                    "total number of tokens recv": self.tot_num_toks_recv[i],
                 }
                 for j in range(self.num_experts):
-                    dic[f"expert_{j} num tokens"] = self.num_token_each_expert[j][i]
+                    dic[f"expert_{j} num tokens sent"] = self.num_toks_each_expert_send[j][i]
+                    dic[f"expert_{j} num tokens recv"] = self.num_toks_each_expert_recv[j][i]
                 for j in range(self.num_gpus):
-                    dic[f"gpu:{j} num tokens"] = self.num_token_each_gpu[j][i]
-                dic[f"gpu:{torch.cuda.current_device()} comp num tokens"] = self.num_token_comp[i]
+                    dic[f"gpu:{j} num tokens sent"] = self.num_toks_each_gpu_send[j][i]
                 
                 writer.writerow(dic)
 
@@ -347,6 +361,29 @@ class SwitchTransformersSparseMLP(nn.Module):
                 tokens = hidden_states[router_mask[:,:,j]]
                 schedule[i][j] = (0,tokens.shape[0],tokens)
         return schedule
+    
+    # TODO need way to update router_prob to 1 to the dropped tokens
+    def schedule_drop(self, hidden_states, router_mask):
+        expert_gpu = [[0, 1], [2, 3], [4, 5], [6, 7]]
+        amounts = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+        token_sizes = [hidden_states[router_mask[:,:,idx]].shape[0] for idx in range(self.num_experts)]
+        avg = int(sum(token_sizes) / self.num_gpus)
+        num_toks_each_gpu = [0 for _ in range(self.num_gpus)]
+
+        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+        for i in range(self.num_gpus):
+            for j in expert_gpu[i]:
+                amt_can_allocate = min(avg-num_toks_each_gpu[i], token_sizes[j])
+                if amt_can_allocate == 0:
+                    break
+                num_toks_each_gpu[i] += amt_can_allocate
+                schedule[i][j] = (0, amt_can_allocate, hidden_states[router_mask[:,:,j]][0:amt_can_allocate, :])
+        
+        # print(list(map(lambda x: list(map(lambda y: y[2].shape[0] if y is not None else 0, x)), schedule)))
+        return schedule
+
+
     
     def schedule_adnexus(self, hidden_states, router_mask):
         expert_gpu = [[0,1], [2,3], [4,5], [6,7]] # TODO maybe there is a better initialisation
@@ -442,9 +479,9 @@ class SwitchTransformersSparseMLP(nn.Module):
         router_mask = router_mask.bool()
 
         # Collect some stats
-        self.tot_num_tokens.append(hidden_states.shape[0]*hidden_states.shape[1])
+        self.tot_num_toks_send.append(hidden_states.shape[0]*hidden_states.shape[1])
         for j in range(self.num_experts):
-            self.num_token_each_expert[j].append(hidden_states[router_mask[:,:,j]].shape[0])
+            self.num_toks_each_expert_send[j].append(hidden_states[router_mask[:,:,j]].shape[0])
         
         schedule = self.scheduler(hidden_states, router_mask)
 
@@ -460,14 +497,24 @@ class SwitchTransformersSparseMLP(nn.Module):
                 tokens = d[2]
                 metadata_send[i][j] = tokens.shape[0]
                 tokens_send[i] = torch.cat((tokens_send[i], tokens), dim=0)
-            self.num_token_each_gpu[i].append(tokens_send[i].shape[0])
+            self.num_toks_each_gpu_send[i].append(tokens_send[i].shape[0])
 
 
         # Metadata all_to_all
         dist.all_to_all(metadata_recv, metadata_send)
 
         tokens_recv = [torch.empty((torch.sum(metadata_recv[i]),self.config.d_model), device="cuda") for i in range(self.num_gpus)]
-        self.num_token_comp.append(sum(list(torch.sum(metadata_recv[i]).item() for i in range(self.num_gpus))))
+        ## Stat collection
+        tot = 0
+        for j in range(self.num_experts):
+            expert_tot = 0
+            for i in range(self.num_gpus):
+                expert_tot += metadata_recv[i][j].item()
+            self.num_toks_each_expert_recv[j].append(expert_tot)
+            tot += expert_tot
+        self.tot_num_toks_recv.append(tot)
+
+        # self.tot_num_toks_recv.append(sum(list(torch.sum(metadata_recv[i]).item() for i in range(self.num_gpus))))
 
 
         # First data all_to_all
@@ -510,7 +557,7 @@ class SwitchTransformersSparseMLP(nn.Module):
             tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
 
             with torch.cuda.stream(self.expert_offload_stream):
-                if idx+2 < num_experts_work:
+                if idx+2 < num_experts_work and not self.is_expert_loaded[expert_order[idx+2]]:
                     # Load that expert ahead of time
                     self.experts[f"expert_{j}"].cpu()
                     self.experts[f"expert_{expert_order[idx+2]}"].cuda()
