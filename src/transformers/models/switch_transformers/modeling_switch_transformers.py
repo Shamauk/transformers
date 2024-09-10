@@ -382,7 +382,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 num_toks_each_gpu[i] += amt_can_allocate
                 schedule[i][j] = (0, amt_can_allocate, hidden_states[router_mask[:,:,j]][0:amt_can_allocate, :])
         
-        # print(list(map(lambda x: list(map(lambda y: y[2].shape[0] if y is not None else 0, x)), schedule)))
         return schedule
 
 
@@ -579,9 +578,6 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.num_toks_each_expert_recv[j].append(expert_tot)
             tot += expert_tot
         self.tot_num_toks_recv.append(tot)
-
-        # self.tot_num_toks_recv.append(sum(list(torch.sum(metadata_recv[i]).item() for i in range(self.num_gpus))))
-
 
         # First data all_to_all
         dist.all_to_all(tokens_recv, tokens_send)
