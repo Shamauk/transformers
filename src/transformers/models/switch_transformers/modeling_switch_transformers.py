@@ -300,7 +300,7 @@ class SwitchTransformersSparseMLP(nn.Module):
             case _:
                 print("SCHEDULING POLICY NOT IMPLEMENTED")
                 exit(1)
-
+    
     # Builds topology of which gpu will be pre-allocatedly in charge of which gpus
     # Will then load the rank's experts in the topology (as much as it has space)
     def expert_parallelise(self):
@@ -323,6 +323,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                     # max_experts_loaded
                     self.experts[f"expert_{j}"].cuda()
                     self.is_expert_loaded[j] = True
+
                 self.topology[i].append(j)
 
             start = end
@@ -359,6 +360,12 @@ class SwitchTransformersSparseMLP(nn.Module):
     # You are to return an array with entry for each gpu for which each entry
     # has a tuple or None value for each expert. The tuple comprises of
     # (start,end,tokens)
+
+    def print(self, value):
+        print(f"(rank:{self.rank}) {value}")
+
+    def print_schedule(self, schedule):
+        self.print(list(map(lambda x: list(map(lambda y: y[2].shape[0] if y is not None else 0, x)), schedule)))
 
     def schedule_naive(self, hidden_states, router_mask):
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
@@ -455,7 +462,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
         avg = sum(expert_sizes) // self.num_gpus
-        multiplier = 1.0
+        multiplier = 1.15
         avg_multiplier = int(multiplier * avg)
 
         allocation = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
@@ -476,15 +483,16 @@ class SwitchTransformersSparseMLP(nn.Module):
                         max_amount = allocation[i][j]
                         max_expert = j
 
+
                 # Get the offload GPU for that expert
                 offload_gpu = -1
                 for j in range(self.num_gpus):
-                    if j != i and max_expert in self.topology[(i+1)%self.num_gpus]:
+                    if j != i and max_expert in self.topology[(j+1)%self.num_gpus]:
                         offload_gpu = j
                         break
-
+                
                 # Calculate maximal amount that can be shared 
-                amount_to_share = min(sum(allocation[i])-avg_multiplier, allocation[i][j])
+                amount_to_share = min(sum(allocation[i])-avg_multiplier, allocation[i][max_expert])
                 amount_to_share = min(amount_to_share, avg-sum(allocation[offload_gpu]))
 
                 # If maximal amount is zero then break
@@ -506,7 +514,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 if allocation[i][j] == 0:
                     continue
                 end += allocation[i][j]
-                # print(f"({start}:{end})")
                 schedule[i][j] = (start,end,expert_inputs[j][start:end])
                 start = end 
 
