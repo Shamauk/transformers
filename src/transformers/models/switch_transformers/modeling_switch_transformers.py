@@ -273,6 +273,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         self.is_expert_loaded = [False for _ in range(self.num_experts)]
         self.original_loaded_experts = []
+        self.topology = [[] for _ in range(self.num_gpus)]
 
         self.expert_offload_stream = torch.cuda.Stream()
         self.expert_loaded_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
@@ -301,7 +302,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                 print("SCHEDULING POLICY NOT IMPLEMENTED")
                 exit(1)
 
-        
+    # TODO write what func does
     def expert_parallelise(self):
         # TODO maybe have some way of specifying initial setup
         # Do a naive for now 
@@ -313,14 +314,39 @@ class SwitchTransformersSparseMLP(nn.Module):
         #     self.original_loaded_experts.append(i)
         # return
 
+        # OLD
+        # num_experts_per_gpu = self.num_experts // self.num_gpus
+        # start = self.rank * num_experts_per_gpu
+        # end = (self.rank+1) * num_experts_per_gpu
+        # for i in range(start, end):
+        #     self.experts[f"expert_{i}"].cuda()
+        #     self.is_expert_loaded[i] = True
+        #     self.original_loaded_experts.append(i)
 
+        
         num_experts_per_gpu = self.num_experts // self.num_gpus
-        start = self.rank * num_experts_per_gpu
-        end = (self.rank+1) * num_experts_per_gpu
-        for i in range(start, end):
-            self.experts[f"expert_{i}"].cuda()
-            self.is_expert_loaded[i] = True
-            self.original_loaded_experts.append(i)
+        leftover = self.num_experts % self.num_gpus
+        start = 0
+        end = 0 # Not inclusive
+        for i in range(self.num_gpus):
+            end += num_experts_per_gpu
+            if leftover > 0:
+                end += 1
+                leftover -= 1
+            
+            for j in range(start,end):
+                if i == self.rank:
+                    # Let us load only the first few we are cable of
+                    # max_experts_loaded
+                    self.experts[f"expert_{j}"].cuda()
+                    self.is_expert_loaded[j] = True
+                self.topology[i].append(j)
+
+            start = end
+        
+        print(f"{self.rank}: {self.is_expert_loaded}\t{self.topology}")
+        exit(1)
+
        
 
     def expert_save_latencies(self, DIR=""):
