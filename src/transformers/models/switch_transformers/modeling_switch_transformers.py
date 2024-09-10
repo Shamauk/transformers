@@ -272,7 +272,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.num_toks_each_expert_recv = [[] for _ in range(self.num_experts)]
 
         self.is_expert_loaded = [False for _ in range(self.num_experts)]
-        self.original_loaded_experts = []
         self.topology = [[] for _ in range(self.num_gpus)]
 
         self.expert_offload_stream = torch.cuda.Stream()
@@ -302,28 +301,12 @@ class SwitchTransformersSparseMLP(nn.Module):
                 print("SCHEDULING POLICY NOT IMPLEMENTED")
                 exit(1)
 
-    # TODO write what func does
+    # Builds topology of which gpu will be pre-allocatedly in charge of which gpus
+    # Will then load the rank's experts in the topology (as much as it has space)
     def expert_parallelise(self):
         # TODO maybe have some way of specifying initial setup
         # Do a naive for now 
 
-        # Temp to see if loading is the slow down
-        # for i in range(self.num_experts):
-        #     self.experts[f"expert_{i}"].cuda()
-        #     self.is_expert_loaded[i] = True
-        #     self.original_loaded_experts.append(i)
-        # return
-
-        # OLD
-        # num_experts_per_gpu = self.num_experts // self.num_gpus
-        # start = self.rank * num_experts_per_gpu
-        # end = (self.rank+1) * num_experts_per_gpu
-        # for i in range(start, end):
-        #     self.experts[f"expert_{i}"].cuda()
-        #     self.is_expert_loaded[i] = True
-        #     self.original_loaded_experts.append(i)
-
-        
         num_experts_per_gpu = self.num_experts // self.num_gpus
         leftover = self.num_experts % self.num_gpus
         start = 0
@@ -343,10 +326,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 self.topology[i].append(j)
 
             start = end
-        
-        print(f"{self.rank}: {self.is_expert_loaded}\t{self.topology}")
-        exit(1)
-
        
 
     def expert_save_latencies(self, DIR=""):
@@ -659,11 +638,11 @@ class SwitchTransformersSparseMLP(nn.Module):
         # almost certainly be loaded already (so no need to syncrhonize)
         with torch.cuda.stream(self.expert_offload_stream):
             for j in range(self.num_experts):
-                if self.is_expert_loaded[j] and j not in self.original_loaded_experts:
+                if self.is_expert_loaded[j] and j not in self.topology[self.rank]:
                     self.experts[f"expert_{j}"].cpu()
                     self.is_expert_loaded[j] = False
             
-            for j in self.original_loaded_experts:
+            for j in self.topology[self.rank]:
                 if not self.is_expert_loaded[j]:
                     self.experts[f"expert_{j}"].cuda()
                     self.is_expert_loaded[j] = True
