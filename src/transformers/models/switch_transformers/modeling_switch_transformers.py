@@ -295,6 +295,8 @@ class SwitchTransformersSparseMLP(nn.Module):
                 self.scheduler = self.schedule_even_split
             case "drop":
                 self.scheduler = self.schedule_drop
+            case "demeter":
+                self.scheduler = self.schedule_demeter
             case _:
                 print("SCHEDULING POLICY NOT IMPLEMENTED")
                 exit(1)
@@ -450,6 +452,70 @@ class SwitchTransformersSparseMLP(nn.Module):
                 start = end 
                 
         return schedule 
+    
+    def schedule_demeter(self, hidden_states, router_mask):
+        expert_gpu = [[0,1], [2,3], [4,5], [6,7]] #TODO Want to be able to create this dynamically
+        expert_gpu_overload = [[2,3], [4,5], [6,7], [0,1]] #TODO Just do a left shift fo now
+
+        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
+        expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
+        avg = sum(expert_sizes) // self.num_gpus
+        multiplier = 1.0
+        avg_multiplier = int(multiplier * avg)
+
+        allocation = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+        # Step 1: Initial Allocation
+        for gpu_idx, experts in enumerate(expert_gpu):
+            for expert in experts:
+                allocation[gpu_idx][expert] = expert_sizes[expert]
+
+        # Step 2: Rebalance
+        for i in range(self.num_gpus):
+            while sum(allocation[i]) > avg_multiplier:
+                # Get largest expert
+                max_expert = -1
+                max_amount = -1
+                for j in range(self.num_experts):
+                    if allocation[i][j] > max_amount:
+                        max_amount = allocation[i][j]
+                        max_expert = j
+
+                # Get the offload GPU for that expert
+                offload_gpu = -1
+                for j in range(self.num_gpus):
+                    if j != i and max_expert in expert_gpu_overload[i]:
+                        offload_gpu = j
+                        break
+
+                # Calculate maximal amount that can be shared 
+                amount_to_share = min(sum(allocation[i])-avg_multiplier, allocation[i][j])
+                amount_to_share = min(amount_to_share, avg-sum(allocation[offload_gpu]))
+
+                # If maximal amount is zero then break
+                if amount_to_share <= 0:
+                    break
+
+                # Update
+                allocation[i][max_expert] -= amount_to_share
+                allocation[offload_gpu][max_expert] += amount_to_share
+
+        
+        # Building schedule
+        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+        for j in range(self.num_experts):
+            start = 0
+            end = 0
+            for i in range(self.num_gpus):
+                if allocation[i][j] == 0:
+                    continue
+                end += allocation[i][j]
+                # print(f"({start}:{end})")
+                schedule[i][j] = (start,end,expert_inputs[j][start:end])
+                start = end 
+
+        return schedule
 
     def schedule_even_split(self, hidden_states, router_mask):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
