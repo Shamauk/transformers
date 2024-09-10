@@ -319,7 +319,7 @@ class SwitchTransformersSparseMLP(nn.Module):
             
             for j in range(start,end):
                 if i == self.rank:
-                    # Let us load only the first few we are cable of
+                    # Let us load only the first few we are capable of
                     # max_experts_loaded
                     self.experts[f"expert_{j}"].cuda()
                     self.is_expert_loaded[j] = True
@@ -361,17 +361,15 @@ class SwitchTransformersSparseMLP(nn.Module):
     # (start,end,tokens)
 
     def schedule_naive(self, hidden_states, router_mask):
-        expert_gpu = [[0,1], [2,3], [4,5], [6,7]]
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
         for i in range(self.num_gpus):
-            for j in expert_gpu[i]:
+            for j in self.topology[i]:
                 tokens = hidden_states[router_mask[:,:,j]]
                 schedule[i][j] = (0,tokens.shape[0],tokens)
         return schedule
     
     # TODO need way to update router_prob to 1 to the dropped tokens
     def schedule_drop(self, hidden_states, router_mask):
-        expert_gpu = [[0, 1], [2, 3], [4, 5], [6, 7]]
         amounts = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
         token_sizes = [hidden_states[router_mask[:,:,idx]].shape[0] for idx in range(self.num_experts)]
         avg = int(sum(token_sizes) / self.num_gpus)
@@ -380,7 +378,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
         for i in range(self.num_gpus):
-            for j in expert_gpu[i]:
+            for j in self.topology[i]:
                 amt_can_allocate = min(avg-num_toks_each_gpu[i], token_sizes[j])
                 if amt_can_allocate == 0:
                     break
@@ -388,15 +386,11 @@ class SwitchTransformersSparseMLP(nn.Module):
                 schedule[i][j] = (0, amt_can_allocate, hidden_states[router_mask[:,:,j]][0:amt_can_allocate, :])
         
         return schedule
-
-
     
     def schedule_adnexus(self, hidden_states, router_mask):
-        expert_gpu = [[0,1], [2,3], [4,5], [6,7]] # TODO maybe there is a better initialisation
-
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         cur_gpu_assignment = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        for i, experts in enumerate(expert_gpu):
+        for i, experts in enumerate(self.topology):
             for expert in experts:
                 cur_gpu_assignment[i][expert] = expert_inputs[expert].size(dim=0)
         cur_num_tokens = list(map(lambda arr: sum(arr), cur_gpu_assignment))
@@ -458,9 +452,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         return schedule 
     
     def schedule_demeter(self, hidden_states, router_mask):
-        expert_gpu = [[0,1], [2,3], [4,5], [6,7]] #TODO Want to be able to create this dynamically
-        expert_gpu_overload = [[2,3], [4,5], [6,7], [0,1]] #TODO Just do a left shift fo now
-
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
         avg = sum(expert_sizes) // self.num_gpus
@@ -470,7 +461,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         allocation = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
         # Step 1: Initial Allocation
-        for gpu_idx, experts in enumerate(expert_gpu):
+        for gpu_idx, experts in enumerate(self.topology):
             for expert in experts:
                 allocation[gpu_idx][expert] = expert_sizes[expert]
 
@@ -488,7 +479,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                 # Get the offload GPU for that expert
                 offload_gpu = -1
                 for j in range(self.num_gpus):
-                    if j != i and max_expert in expert_gpu_overload[i]:
+                    if j != i and max_expert in self.topology[(i+1)%self.num_gpus]:
                         offload_gpu = j
                         break
 
