@@ -287,8 +287,8 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.experts[f"expert_{idx}"] = expert_class(config)
 
         match self.config.scheduling_policy:
-            case "naive":
-                self.scheduler = self.schedule_naive
+            case "deepspeed":
+                self.scheduler = self.schedule_deepspeed
             case "adnexus":
                 self.scheduler = self.schedule_adnexus
             case "even_split":
@@ -367,7 +367,7 @@ class SwitchTransformersSparseMLP(nn.Module):
     def print_schedule(self, schedule):
         self.print(list(map(lambda x: list(map(lambda y: y[2].shape[0] if y is not None else 0, x)), schedule)))
 
-    def schedule_naive(self, hidden_states, router_mask):
+    def schedule_deepspeed(self, hidden_states, router_mask):
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
         for i in range(self.num_gpus):
             for j in self.topology[i]:
