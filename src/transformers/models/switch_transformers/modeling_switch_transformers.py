@@ -542,6 +542,10 @@ class SwitchTransformersSparseMLP(nn.Module):
     @torch.no_grad()
     def forward(self, hidden_states):
         router_mask, router_probs, router_logits = self.router(hidden_states)
+        # router_mask has dim (batch_size, seq_len, num_experts)
+        # Entry will be a 1 on which expert to work on for the specific token
+        # at specific sequence index on specific sample, rest will be 0
+        
         expert_index = torch.argmax(router_mask, dim=-1)
         next_states = hidden_states.clone()
         router_mask = router_mask.bool()
