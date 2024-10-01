@@ -125,6 +125,9 @@ class SwitchTransformersConfig(PretrainedConfig):
         use_cache=True,
         pad_token_id=0,
         eos_token_id=1,
+        enable_rebalancing=True,
+        rebalancing_frequency=15,
+        max_loaded_experts=2,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -175,6 +178,10 @@ class SwitchTransformersConfig(PretrainedConfig):
         self.router_z_loss_coef = router_z_loss_coef
         self.router_aux_loss_coef = router_aux_loss_coef
         self.dense_act_fn = dense_act_fn
+
+        self.enable_rebalancing = enable_rebalancing
+        self.rebalancing_frequency = rebalancing_frequency
+        self.max_loaded_experts = max_loaded_experts
 
         super().__init__(
             pad_token_id=pad_token_id,
