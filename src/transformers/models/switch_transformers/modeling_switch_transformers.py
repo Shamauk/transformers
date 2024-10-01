@@ -679,36 +679,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                     self.is_expert_loaded[expert_order[q+1]] = True 
                     self.expert_loaded_events[expert_order[q+1]].record()
 
-
-            # with torch.cuda.stream(self.expert_offload_stream):
-            #     # Let us fetch the next expert to work on
-            #     # TODO fix expert fetching
-            #     # THIS IS THE ISSUE, need to figure out what is the max
-
-            #     if idx+2 < num_experts_work and not self.is_expert_loaded[expert_order[idx+2]]:
-            #         # Load that expert ahead of time
-            #         self.experts[f"expert_{j}"].cpu()
-            #         self.experts[f"expert_{expert_order[idx+2]}"].cuda()
-            #         self.is_expert_loaded[j] = False
-            #         self.is_expert_loaded[expert_order[idx+2]] = True 
-            #         self.expert_loaded_events[expert_order[idx+2]].record()
-            
-
-        # Let us add back the original experts
-        # By the time we come back to this layer it will
-        # almost certainly be loaded already (so no need to syncrhonize)
-        # with torch.cuda.stream(self.expert_offload_stream):
-        #     for j in range(self.num_experts):
-        #         if self.is_expert_loaded[j] and j not in self.topology[self.rank]:
-        #             self.experts[f"expert_{j}"].cpu()
-        #             self.is_expert_loaded[j] = False
-            
-        #     for j in self.topology[self.rank]:
-        #         if not self.is_expert_loaded[j]:
-        #             self.experts[f"expert_{j}"].cuda()
-        #             self.is_expert_loaded[j] = True
-
-
         # Distribute tokens back
         for j in range(self.num_experts):
             start = 0
@@ -739,18 +709,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 start = end           
 
         hidden_states = router_probs * next_states
-
-
-            # 
-        #     for j in range(self.num_experts):
-        #         if self.is_expert_loaded[j] and j not in self.topology[self.rank]:
-        #             self.experts[f"expert_{j}"].cpu()
-        #             self.is_expert_loaded[j] = False
-            
-        #     for j in self.topology[self.rank]:
-        #         if not self.is_expert_loaded[j]:
-        #             self.experts[f"expert_{j}"].cuda()
-        #             self.is_expert_loaded[j] = True
 
         # Here perform any rebalancing 
         with torch.cuda.stream(self.expert_offload_stream):
