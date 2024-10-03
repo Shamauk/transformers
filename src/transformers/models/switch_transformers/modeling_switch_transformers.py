@@ -272,9 +272,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.tot_num_toks_recv = []
         self.num_toks_each_expert_recv = [[] for _ in range(self.num_experts)]
 
-        # self.is_expert_loaded = [False for _ in range(self.num_experts)]
-        # self.topology = [[] for _ in range(self.num_gpus)]
-
         self.expert_offload_stream = torch.cuda.Stream()
         self.expert_loaded_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
         self.max_loaded_experts = config.max_loaded_experts
@@ -675,12 +672,6 @@ class SwitchTransformersSparseMLP(nn.Module):
             if tokens_comp[j].size(dim=0) == 0:
                 continue
 
-            # TODO figure some pass that if we have extra experts
-            # to work on then topology, first unload any that are
-            # not apart of topo and load those non-topo expert
-            # evidently first check if the non-topo expert 
-            # will be used, if so then do not unload
-
             num_experts_work += 1
             if self.is_expert_loaded[j]:
                 expert_order.insert(0, j)
@@ -719,10 +710,8 @@ class SwitchTransformersSparseMLP(nn.Module):
                 break
     
 
-        #self.print(expert_order)
         for idx, j in enumerate(expert_order):
             self.expert_loaded_events[j].synchronize()
-            #self.print(f"(layer:{self.layer_idx}) Tokens on device: {tokens_comp[j].device} and Expert {j} on device: {self.experts[f'expert_{j}'].wo.weight.device}")
             tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
 
             # Find next job that isn't loaded
@@ -737,15 +726,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                 # We have a work order for an expert not in memory
                 self.unload_expert(j)
                 self.load_expert(expert_order[q+1])
-                # self.print(f"Loading expert: {expert_order[q+1]} from {j}")
-
-                # with torch.cuda.stream(self.expert_offload_stream):
-                #     self.experts[f"expert_{j}"].cpu()
-                #     self.experts[f"expert_{expert_order[q+1]}"].cuda()
-                #     self.is_expert_loaded[j] = False
-                #     self.is_expert_loaded[expert_order[q+1]] = True 
-                #     self.expert_loaded_events[expert_order[q+1]].record()
-
+                
         # Distribute tokens back
         for j in range(self.num_experts):
             start = 0
@@ -812,15 +793,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                         self.load_expert(j)
 
                         idx -= 1
-
-                        # self.experts[f"expert_{expert_order[idx]}"].cpu()
-                        # self.experts[f"expert_{j}"].cuda()
-                        # self.is_expert_loaded[expert_order[idx]] = False 
-                        # self.is_expert_loaded[j] = True
-                        # self.expert_loaded_events[j].record()
-
-                        # idx -= 1
-
 
         return hidden_states, (router_logits, expert_index)
 
@@ -2408,16 +2380,6 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
         >>> last_hidden_states = outputs.last_hidden_state
         ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # if self.num_gpus > 0:
-        #     if input_ids is not None:
-        #         input_ids = input_ids.to("cuda:0")
-        #     if attention_mask is not None:
-        #         attention_mask = attention_mask.to("cuda:0")
-        #     if inputs_embeds is not None:
-        #         inputs_embeds = inputs_embeds.to("cuda:0")
-        #     if head_mask is not None:
-        #         head_mask = head_mask.to("cuda:0")
 
         encoder_outputs = self.encoder(
             input_ids=input_ids,
