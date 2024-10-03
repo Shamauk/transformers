@@ -255,7 +255,7 @@ class SwitchTransformersDenseActDense(nn.Module):
         return hidden_states
 
 class SwitchTransformersSparseMLP(nn.Module):
-    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None):
+    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None, is_decoder=False):
         super().__init__()
         self.layer_idx = layer_idx
 
@@ -263,6 +263,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.num_gpus = dist.get_world_size()
         self.rank = dist.get_rank()
         self.config = config
+        self.is_decoder = is_decoder
 
         self.tot_num_toks_send = []
         self.num_toks_each_expert_send = [[] for _ in range(self.num_experts)]
@@ -290,20 +291,23 @@ class SwitchTransformersSparseMLP(nn.Module):
         for idx in range(self.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config)
 
-        match self.config.scheduling_policy:
-            case "deepspeed":
-                self.scheduler = self.schedule_deepspeed
-            case "adnexus":
-                self.scheduler = self.schedule_adnexus
-            case "even_split":
-                self.scheduler = self.schedule_even_split
-            case "drop":
-                self.scheduler = self.schedule_drop
-            case "demeter":
-                self.scheduler = self.schedule_demeter
-            case _:
-                print("SCHEDULING POLICY NOT IMPLEMENTED")
-                exit(1)
+        if self.is_decoder:
+            self.scheduler = self.schedule_deepspeed
+        else:
+            match self.config.scheduling_policy:
+                case "deepspeed":
+                    self.scheduler = self.schedule_deepspeed
+                case "adnexus":
+                    self.scheduler = self.schedule_adnexus
+                case "even_split":
+                    self.scheduler = self.schedule_even_split
+                case "drop":
+                    self.scheduler = self.schedule_drop
+                case "demeter":
+                    self.scheduler = self.schedule_demeter
+                case _:
+                    print("SCHEDULING POLICY NOT IMPLEMENTED")
+                    exit(1)
     
     def load_topology(self, topo):
         self.topology = topo
@@ -345,7 +349,11 @@ class SwitchTransformersSparseMLP(nn.Module):
        
 
     def expert_save_latencies(self, DIR=""):
-        with open(f"{DIR}/moe_l{self.layer_idx}.csv", "w") as f:
+        path = f"{DIR}/moe_l{self.layer_idx}"
+        if self.is_decoder:
+            path += "_decode"
+
+        with open(f"{path}.csv", "w") as f:
             fieldnames = ["iteration", "total number of tokens sent", "total number of tokens recv"]
             for j in range(self.num_experts):
                 fieldnames.append(f"expert_{j} num tokens sent")
@@ -575,6 +583,20 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         return topo
 
+    def load_expert(self, expert_idx):
+        with torch.cuda.stream(self.expert_offload_stream):
+            if not self.is_expert_loaded[expert_idx]:
+                self.experts[f"expert_{expert_idx}"].cuda()
+                self.is_expert_loaded[expert_idx] = True
+                self.expert_loaded_events[expert_idx].record()
+    
+    def unload_expert(self, expert_idx):
+        with torch.cuda.stream(self.expert_offload_stream):
+            if self.is_expert_loaded[expert_idx]:
+                self.experts[f"expert_{expert_idx}"].cpu()
+                self.is_expert_loaded[expert_idx] = False
+                self.expert_loaded_events[expert_idx] = torch.cuda.Event(enable_timing=False)
+
     @torch.no_grad()
     def forward(self, hidden_states):
         router_mask, router_probs, router_logits = self.router(hidden_states)
@@ -653,14 +675,54 @@ class SwitchTransformersSparseMLP(nn.Module):
             if tokens_comp[j].size(dim=0) == 0:
                 continue
 
+            # TODO figure some pass that if we have extra experts
+            # to work on then topology, first unload any that are
+            # not apart of topo and load those non-topo expert
+            # evidently first check if the non-topo expert 
+            # will be used, if so then do not unload
+
             num_experts_work += 1
             if self.is_expert_loaded[j]:
                 expert_order.insert(0, j)
             else:
                 expert_order.append(j)
 
+        # With our expert order make sure we saturate the number of experts we can have
+        # First let us see which experts in our topo is not being used
+        loaded_experts_not_in_use = []
+        loaded_experts_in_use = []
+        loaded_count = 0
+        for expert_idx in range(self.num_experts):
+            if self.is_expert_loaded[expert_idx]:
+                loaded_count += 1
+                if expert_idx in expert_order:
+                    loaded_experts_in_use.append(expert_idx)
+                else:
+                    if expert_idx not in self.topology[self.rank]:
+                        # We want to unload first what is not apart of the topo
+                        loaded_experts_not_in_use.insert(0, expert_idx)
+                    else:
+                        loaded_experts_not_in_use.append(expert_idx)
+
+
+        # Load as much as we can ahead of time
+        for expert_idx in expert_order[len(loaded_experts_in_use):]:
+            # We know each will not be loaded, since loaded is at the start
+            if loaded_count < self.max_loaded_experts:
+                self.load_expert(expert_idx)
+                loaded_count += 1
+            elif len(loaded_experts_not_in_use) > 0:
+                self.unload_expert(loaded_experts_not_in_use.pop(0))
+                self.load_expert(expert_idx)
+            else:
+                # We have no options but to load later
+                break
+    
+
+        #self.print(expert_order)
         for idx, j in enumerate(expert_order):
             self.expert_loaded_events[j].synchronize()
+            #self.print(f"(layer:{self.layer_idx}) Tokens on device: {tokens_comp[j].device} and Expert {j} on device: {self.experts[f'expert_{j}'].wo.weight.device}")
             tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
 
             # Find next job that isn't loaded
@@ -672,12 +734,17 @@ class SwitchTransformersSparseMLP(nn.Module):
 
             # Now let us load it in
             if q+1 < num_experts_work: # Check if it is valid, invalid means all loaded
-                with torch.cuda.stream(self.expert_offload_stream):
-                    self.experts[f"expert_{j}"].cpu()
-                    self.experts[f"expert_{expert_order[q+1]}"].cuda()
-                    self.is_expert_loaded[j] = False
-                    self.is_expert_loaded[expert_order[q+1]] = True 
-                    self.expert_loaded_events[expert_order[q+1]].record()
+                # We have a work order for an expert not in memory
+                self.unload_expert(j)
+                self.load_expert(expert_order[q+1])
+                # self.print(f"Loading expert: {expert_order[q+1]} from {j}")
+
+                # with torch.cuda.stream(self.expert_offload_stream):
+                #     self.experts[f"expert_{j}"].cpu()
+                #     self.experts[f"expert_{expert_order[q+1]}"].cuda()
+                #     self.is_expert_loaded[j] = False
+                #     self.is_expert_loaded[expert_order[q+1]] = True 
+                #     self.expert_loaded_events[expert_order[q+1]].record()
 
         # Distribute tokens back
         for j in range(self.num_experts):
@@ -741,13 +808,18 @@ class SwitchTransformersSparseMLP(nn.Module):
                 # because we run topology experts first. etc.
                 for j in self.topology[self.rank]:
                     if not self.is_expert_loaded[j]:
-                        self.experts[f"expert_{expert_order[idx]}"].cpu()
-                        self.experts[f"expert_{j}"].cuda()
-                        self.is_expert_loaded[expert_order[idx]] = False 
-                        self.is_expert_loaded[j] = True
-                        self.expert_loaded_events[j].record()
+                        self.unload_expert(expert_order[idx])
+                        self.load_expert(j)
 
                         idx -= 1
+
+                        # self.experts[f"expert_{expert_order[idx]}"].cpu()
+                        # self.experts[f"expert_{j}"].cuda()
+                        # self.is_expert_loaded[expert_order[idx]] = False 
+                        # self.is_expert_loaded[j] = True
+                        # self.expert_loaded_events[j].record()
+
+                        # idx -= 1
 
 
         return hidden_states, (router_logits, expert_index)
@@ -765,7 +837,7 @@ class SwitchTransformersLayerFF(nn.Module):
             Whether the MLP layer is a `Sparse` layer (contains a Mixture of Experts) or not
     """
 
-    def __init__(self, config: SwitchTransformersConfig, is_sparse=False, layer_idx=None):
+    def __init__(self, config: SwitchTransformersConfig, is_sparse=False, layer_idx=None, is_decoder=False):
         super().__init__()
         self.is_sparse = is_sparse
 
@@ -773,7 +845,7 @@ class SwitchTransformersLayerFF(nn.Module):
         if not self.is_sparse:
             self.mlp = SwitchTransformersDenseActDense(config)
         else:
-            self.mlp = SwitchTransformersSparseMLP(config, layer_idx=layer_idx)
+            self.mlp = SwitchTransformersSparseMLP(config, layer_idx=layer_idx, is_decoder=is_decoder)
             
 
         self.layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -1114,7 +1186,7 @@ class SwitchTransformersLayerCrossAttention(nn.Module):
 
 
 class SwitchTransformersBlock(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False, is_sparse=False, layer_idx=None):
+    def __init__(self, config, has_relative_attention_bias=False, is_sparse=False, layer_idx=None, is_decoder=False):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.is_sparse = is_sparse
@@ -1125,7 +1197,7 @@ class SwitchTransformersBlock(nn.Module):
         if self.is_decoder:
             self.layer.append(SwitchTransformersLayerCrossAttention(config))
 
-        self.layer.append(SwitchTransformersLayerFF(config, is_sparse=self.is_sparse, layer_idx=layer_idx))
+        self.layer.append(SwitchTransformersLayerFF(config, is_sparse=self.is_sparse, layer_idx=layer_idx, is_decoder=is_decoder))
     
     def expert_parallelise(self):
         for layer in self.layer:
@@ -1342,7 +1414,7 @@ class SwitchTransformersPreTrainedModel(PreTrainedModel):
 
 
 class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
-    def __init__(self, config, embed_tokens=None):
+    def __init__(self, config, embed_tokens=None, is_decoder=False):
         super().__init__(config)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
@@ -1359,7 +1431,7 @@ class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
             is_sparse = (i % sparse_step == 1 or sparse_step == 1) if sparse_step > 0 else False
 
             self.block.append(
-                SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse, layer_idx=i)
+                SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse, layer_idx=i, is_decoder=is_decoder)
             )
 
         self.final_layer_norm = SwitchTransformersLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -1946,7 +2018,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = SwitchTransformersStack(decoder_config, self.shared)
+        self.decoder = SwitchTransformersStack(decoder_config, self.shared, is_decoder=True)
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -1958,6 +2030,14 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
 
         # Model parallel
         self.device_map = None
+    
+    def expert_parallelise(self):
+        self.encoder.expert_parallelise()
+        self.decoder.expert_parallelise()
+    
+    def expert_save_latencies(self, DIR=""):
+        self.encoder.expert_save_latencies(DIR=DIR)
+        self.decoder.expert_save_latencies(DIR=DIR)
 
     def get_input_embeddings(self):
         return self.shared
@@ -2255,11 +2335,9 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
 class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
     _tied_weights_keys = ["encoder.embed_tokens.weight"]
 
-    def __init__(self, config: SwitchTransformersConfig, scheduling_policy="naive"):
+    def __init__(self, config: SwitchTransformersConfig):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
-
-        config.scheduling_policy = scheduling_policy
 
         encoder_config = copy.deepcopy(config)
         encoder_config.use_cache = False
