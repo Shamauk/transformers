@@ -632,26 +632,6 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.num_experts
         )
 
-        # if self.is_decoder:
-            
-
-        #     self.scheduler = self.schedule_deepspeed
-        # else:
-        #     match self.config.scheduling_policy:
-        #         case "deepspeed":
-        #             self.scheduler = self.schedule_deepspeed
-        #         case "adnexus":
-        #             self.scheduler = self.schedule_adnexus
-        #         case "even_split":
-        #             self.scheduler = self.schedule_even_split
-        #         case "drop":
-        #             self.scheduler = self.schedule_drop
-        #         case "demeter":
-        #             self.scheduler = self.schedule_demeter
-        #         case _:
-        #             print("SCHEDULING POLICY NOT IMPLEMENTED")
-        #             exit(1)
-        
         self.expert_manager = ExpertManager(self.experts, config, expert_class, self.max_loaded_experts)
     
     def expert_parallelise(self):
@@ -687,18 +667,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                     dic[f"gpu:{j} num tokens sent"] = self.num_toks_each_gpu_send[j][i]
                 
                 writer.writerow(dic)
-
-
-    # FOR SCHEDULING
-    # You are to return an array with entry for each gpu for which each entry
-    # has a tuple or None value for each expert. The tuple comprises of
-    # (start,end,tokens)
-
-    # def print(self, value):
-    #     print(f"(rank:{self.rank}) {value}")
-
-    # def print_schedule(self, schedule):
-    #     self.print(list(map(lambda x: list(map(lambda y: y[2].shape[0] if y is not None else 0, x)), schedule)))
 
     @torch.no_grad()
     def forward(self, hidden_states):
