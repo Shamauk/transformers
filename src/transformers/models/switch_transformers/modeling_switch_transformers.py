@@ -395,10 +395,12 @@ class ExpertManager():
     #     return topo
 
 class Scheduler():
-    def __init__(self, scheduling_policy, num_experts):
+    def __init__(self, scheduling_policy, config):
         self.rank = dist.get_rank()
         self.num_gpus = dist.get_world_size()
-        self.num_experts = num_experts
+        self.num_experts = config.num_experts
+        self.eq_tokens = config.eq_tokens
+
 
         match scheduling_policy:
                 case "deepspeed":
@@ -453,10 +455,9 @@ class Scheduler():
                 cur_gpu_assignment[i][expert] = expert_inputs[expert].size(dim=0)
         cur_num_tokens = list(map(lambda arr: sum(arr), cur_gpu_assignment))
         avg = int(sum(cur_num_tokens) / self.num_gpus)
-        cutoff = int(avg * 1.15) # TODO change magic number to empirical value
 
         for i in range(self.num_gpus):
-            while cur_num_tokens[i] > cutoff:
+            while cur_num_tokens[i] > avg:
                 # Find minimum
                 _min = cur_num_tokens[0]
                 min_idx = 0
@@ -468,8 +469,10 @@ class Scheduler():
                 # Check if suitable place to move tokens
                 if min_idx == i:
                     break
-                if _min > avg:
+                if _min + self.eq_tokens > avg:
                     break
+                # if _min > avg:
+                    # break
 
                 # Get the maximal expert to move
                 _max = -1
@@ -481,10 +484,12 @@ class Scheduler():
 
                 # Find maximal tokens that can be sent
                 # Between how much we want to reduce and the amount the maximal expert has 
-                tokens_to_spread = min(_max, cur_num_tokens[i] - cutoff)
+                tokens_to_spread = min(_max, cur_num_tokens[i] - avg)
                 # Between how much we can reduce thus far and the amount we can add to minimal gpu
                 tokens_to_spread = min(tokens_to_spread, avg - cur_num_tokens[min_idx])
 
+                if tokens_to_spread < self.eq_tokens:
+                    break
 
                 # Update assignment
                 cur_gpu_assignment[i][max_expert] -= tokens_to_spread
@@ -629,7 +634,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         self.scheduler = Scheduler(
             self.config.scheduling_policy if not self.is_decoder else "deepspeed", 
-            self.num_experts
+            config
         )
 
         self.expert_manager = ExpertManager(self.experts, config, expert_class, self.max_loaded_experts)

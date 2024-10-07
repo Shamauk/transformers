@@ -129,6 +129,7 @@ class SwitchTransformersConfig(PretrainedConfig):
         rebalancing_frequency=15,
         max_loaded_experts=2,
         scheduling_policy="deepspeed",
+        eq_tokens=150,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -184,6 +185,7 @@ class SwitchTransformersConfig(PretrainedConfig):
         self.rebalancing_frequency = rebalancing_frequency
         self.max_loaded_experts = max_loaded_experts
         self.scheduling_policy = scheduling_policy
+        self.eq_tokens = eq_tokens
 
         super().__init__(
             pad_token_id=pad_token_id,
