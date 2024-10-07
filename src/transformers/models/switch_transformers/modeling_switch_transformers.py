@@ -254,6 +254,126 @@ class SwitchTransformersDenseActDense(nn.Module):
 
         return hidden_states
 
+class ExpertManager():
+    def __init__(self, experts: nn.ModuleDict, config: SwitchTransformersConfig, expert_class: nn.Module, max_loaded_experts: int):
+        self.cpu_experts = experts
+        self.num_experts = len(experts)
+        self.rank = dist.get_rank()
+        self.num_gpus = dist.get_world_size()
+        self.max_loaded_experts = max_loaded_experts
+
+        # The experts loaded in GPU memory
+        self.stream = torch.cuda.Stream()
+        with torch.cuda.stream(self.stream):
+            self.loaded_experts = [expert_class(config).cuda() for _ in range(self.max_loaded_experts)]
+
+        self.loaded_expert_at_slot = [-1 for _ in range(self.max_loaded_experts)]
+        self.is_slot_loaded = [torch.cuda.Event(enable_timing=False) for _ in range(self.max_loaded_experts)]
+
+    
+    def expert_parallelise(self):
+        self.topology = [[] for _ in range(self.num_gpus)]
+        num_experts_per_gpu = self.num_experts // self.num_gpus
+        leftover = self.num_experts % self.num_gpus
+        start = 0
+        end = 0 # Not inclusive
+        for i in range(self.num_gpus):
+            end += num_experts_per_gpu
+            if leftover > 0:
+                end += 1
+                leftover -= 1
+            
+            for j in range(start,end):
+                self.topology[i].append(j)
+
+            start = end
+
+        self.load_topology()
+    
+    def load_topology(self):
+        if len(self.topology[self.rank]) > self.max_loaded_experts:
+            raise Exception("Cannot load topology given memory requirement, consider increasing max number of loaded experts")
+        
+        for slot_idx, expert_idx in enumerate(self.topology[self.rank]):
+            if self.loaded_expert_at_slot[slot_idx] != expert_idx:
+                self.load_expert(expert_idx, slot_idx)
+    
+    def load_expert(self, expert_idx: int, load_idx: int):
+        with torch.no_grad():
+            with torch.cuda.stream(self.stream):
+                self.loaded_experts[load_idx].wi.weight.copy_(self.cpu_experts[f"expert_{expert_idx}"].wi.weight)
+                self.loaded_experts[load_idx].wo.weight.copy_(self.cpu_experts[f"expert_{expert_idx}"].wo.weight)
+                self.loaded_expert_at_slot[load_idx] = expert_idx
+                self.is_slot_loaded[load_idx].record()
+    
+    def execute_expert(self, expert_idx: int, data):
+        idx = self.expert_loaded_location(expert_idx)
+        if idx == -1:
+            raise Exception("Cannot run expert which is not already loaded")
+        
+        self.is_slot_loaded[idx].synchronize()
+        r = self.loaded_experts[idx](data)
+        return r
+        
+    
+    # Returns index of expert. Returns -1 if not loaded.
+    def expert_loaded_location(self, expert_idx):
+        idx = -1
+        for i, v in enumerate(self.loaded_expert_at_slot):
+            if v == expert_idx:
+                idx = i
+                break
+        return idx 
+    
+    def is_expert_loaded(self, expert_idx):
+        return self.expert_loaded_location(expert_idx) != -1
+    
+    def execute_job(self, workload: []):
+        expert_order = []
+        num_execs = 0
+
+        # Setup
+        for expert_idx in range(self.num_experts):
+            if workload[expert_idx].size(dim=0) == 0:
+                continue
+            
+            num_execs += 1
+            if self.is_expert_loaded(expert_idx):
+                expert_order.insert(0, expert_idx)
+            else:
+                expert_order.append(expert_idx)
+
+        # Start loading as many experts as possible
+        for idx, loaded_expert_idx in enumerate(self.loaded_expert_at_slot):
+            # Fill if a gap or if loaded expert not used
+            if loaded_expert_idx == -1 or loaded_expert_idx not in expert_order:
+                n = self.next_not_loaded_expert(expert_order)
+                if n is None:
+                    break
+
+                self.load_expert(n, idx)
+
+        
+        # Begin execution
+        for idx, expert_idx in enumerate(expert_order):
+            slot_idx = self.expert_loaded_location(expert_idx)
+            self.is_slot_loaded[slot_idx].record()
+            workload[expert_idx] = self.loaded_experts[slot_idx](workload[expert_idx])
+            # Check if anything else needs loading
+            n = self.next_not_loaded_expert(expert_order, idx)
+            if n is not None:
+                self.load_expert(n, slot_idx)
+        
+        return workload
+
+        
+    def next_not_loaded_expert(self, experts, start=0):
+        for idx in range(start,len(experts)):
+            if not self.is_expert_loaded(experts[idx]):
+                return experts[idx]
+        return None
+
+
 class SwitchTransformersSparseMLP(nn.Module):
     def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None, is_decoder=False):
         super().__init__()
@@ -305,44 +425,30 @@ class SwitchTransformersSparseMLP(nn.Module):
                 case _:
                     print("SCHEDULING POLICY NOT IMPLEMENTED")
                     exit(1)
-    
-    def load_topology(self, topo):
-        self.topology = topo
-        self.is_expert_loaded = [False for _ in range(self.num_experts)]
         
-        # First make sure everything is unloaded
-        for j in range(self.num_experts):
-            if self.is_expert_loaded[j] and j not in self.topology[self.rank]:
-                self.experts[f"expert_{j}"].cpu()
+        self.expert_manager = ExpertManager(self.experts, config, expert_class, self.max_loaded_experts)
+    
+    # def load_topology(self, topo):
+    #     self.topology = topo
+    #     self.is_expert_loaded = [False for _ in range(self.num_experts)]
+        
+    #     # First make sure everything is unloaded
+    #     for j in range(self.num_experts):
+    #         if self.is_expert_loaded[j] and j not in self.topology[self.rank]:
+    #             self.experts[f"expert_{j}"].cpu()
 
-        # Load the necessary
-        for expert_idx in self.topology[self.rank]:
-            if not self.is_expert_loaded[expert_idx]:
-                self.experts[f"expert_{expert_idx}"].cuda()
-                self.is_expert_loaded[expert_idx] = True
-                self.expert_loaded_events[expert_idx].record()
+    #     # Load the necessary
+    #     for expert_idx in self.topology[self.rank]:
+    #         if not self.is_expert_loaded[expert_idx]:
+    #             self.experts[f"expert_{expert_idx}"].cuda()
+    #             self.is_expert_loaded[expert_idx] = True
+    #             self.expert_loaded_events[expert_idx].record()
 
     
     # Builds topology of which gpu will be pre-allocatedly in charge of which gpus
     # Will then load the rank's experts in the topology (as much as it has space)
     def expert_parallelise(self):
-        topo = [[] for _ in range(self.num_gpus)]
-        num_experts_per_gpu = self.num_experts // self.num_gpus
-        leftover = self.num_experts % self.num_gpus
-        start = 0
-        end = 0 # Not inclusive
-        for i in range(self.num_gpus):
-            end += num_experts_per_gpu
-            if leftover > 0:
-                end += 1
-                leftover -= 1
-            
-            for j in range(start,end):
-                topo[i].append(j)
-
-            start = end
-
-        self.load_topology(topo)
+        self.expert_manager.expert_parallelise()
        
 
     def expert_save_latencies(self, DIR=""):
@@ -390,7 +496,7 @@ class SwitchTransformersSparseMLP(nn.Module):
     def schedule_deepspeed(self, hidden_states, router_mask):
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
         for i in range(self.num_gpus):
-            for j in self.topology[i]:
+            for j in self.expert_manager.topology[i]:
                 tokens = hidden_states[router_mask[:,:,j]]
                 schedule[i][j] = (0,tokens.shape[0],tokens)
         return schedule
@@ -405,7 +511,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
         for i in range(self.num_gpus):
-            for j in self.topology[i]:
+            for j in self.expert_manager.topology[i]:
                 amt_can_allocate = min(avg-num_toks_each_gpu[i], token_sizes[j])
                 if amt_can_allocate == 0:
                     break
@@ -417,7 +523,7 @@ class SwitchTransformersSparseMLP(nn.Module):
     def schedule_adnexus(self, hidden_states, router_mask):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         cur_gpu_assignment = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        for i, experts in enumerate(self.topology):
+        for i, experts in enumerate(self.expert_manager.topology):
             for expert in experts:
                 cur_gpu_assignment[i][expert] = expert_inputs[expert].size(dim=0)
         cur_num_tokens = list(map(lambda arr: sum(arr), cur_gpu_assignment))
@@ -488,7 +594,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         allocation = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
         # Step 1: Initial Allocation
-        for gpu_idx, experts in enumerate(self.topology):
+        for gpu_idx, experts in enumerate(self.expert_manager.topology):
             for expert in experts:
                 allocation[gpu_idx][expert] = expert_sizes[expert]
 
@@ -507,7 +613,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                 # Get the offload GPU for that expert
                 offload_gpu = -1
                 for j in range(self.num_gpus):
-                    if j != i and max_expert in self.topology[(j+1)%self.num_gpus]:
+                    if j != i and max_expert in self.expert_manager.topology[(j+1)%self.num_gpus]:
                         offload_gpu = j
                         break
                 
@@ -561,38 +667,38 @@ class SwitchTransformersSparseMLP(nn.Module):
 
     
     # Return a topology
-    def greedy_create_topology(self, expert_freq):
-        # TODO add penalty for number of experts on each GPU
+    # def greedy_create_topology(self, expert_freq):
+    #     # TODO add penalty for number of experts on each GPU
         
-        topo = [[] for _ in range(self.num_gpus)]
-        topo_sum = [0 for _ in range(self.num_gpus)]
-        for expert_idx, amt in sorted(enumerate(expert_freq), key=lambda x: x[1], reverse=True):
-            _min = float("inf")
-            min_idx = -1
+    #     topo = [[] for _ in range(self.num_gpus)]
+    #     topo_sum = [0 for _ in range(self.num_gpus)]
+    #     for expert_idx, amt in sorted(enumerate(expert_freq), key=lambda x: x[1], reverse=True):
+    #         _min = float("inf")
+    #         min_idx = -1
 
-            for i in range(self.num_gpus):
-                if topo_sum[i] < _min and len(topo[i]) < self.max_loaded_experts:
-                    _min = topo_sum[i]
-                    min_idx = i
+    #         for i in range(self.num_gpus):
+    #             if topo_sum[i] < _min and len(topo[i]) < self.max_loaded_experts:
+    #                 _min = topo_sum[i]
+    #                 min_idx = i
             
-            topo_sum[min_idx] += amt
-            topo[min_idx].append(expert_idx)
+    #         topo_sum[min_idx] += amt
+    #         topo[min_idx].append(expert_idx)
 
-        return topo
+    #     return topo
 
-    def load_expert(self, expert_idx):
-        with torch.cuda.stream(self.expert_offload_stream):
-            if not self.is_expert_loaded[expert_idx]:
-                self.experts[f"expert_{expert_idx}"].cuda()
-                self.is_expert_loaded[expert_idx] = True
-                self.expert_loaded_events[expert_idx].record()
+    # def load_expert(self, expert_idx):
+    #     with torch.cuda.stream(self.expert_offload_stream):
+    #         if not self.is_expert_loaded[expert_idx]:
+    #             self.experts[f"expert_{expert_idx}"].cuda()
+    #             self.is_expert_loaded[expert_idx] = True
+    #             self.expert_loaded_events[expert_idx].record()
     
-    def unload_expert(self, expert_idx):
-        with torch.cuda.stream(self.expert_offload_stream):
-            if self.is_expert_loaded[expert_idx]:
-                self.experts[f"expert_{expert_idx}"].cpu()
-                self.is_expert_loaded[expert_idx] = False
-                self.expert_loaded_events[expert_idx] = torch.cuda.Event(enable_timing=False)
+    # def unload_expert(self, expert_idx):
+    #     with torch.cuda.stream(self.expert_offload_stream):
+    #         if self.is_expert_loaded[expert_idx]:
+    #             self.experts[f"expert_{expert_idx}"].cpu()
+    #             self.is_expert_loaded[expert_idx] = False
+    #             self.expert_loaded_events[expert_idx] = torch.cuda.Event(enable_timing=False)
 
     @torch.no_grad()
     def forward(self, hidden_states):
@@ -665,67 +771,69 @@ class SwitchTransformersSparseMLP(nn.Module):
                 start = end
 
         # Do computation
+        tokens_comp = self.expert_manager.execute_job(tokens_comp)
+
         # Start with the ones loaded
-        expert_order = []
-        num_experts_work = 0
-        for j in range(self.num_experts):
-            if tokens_comp[j].size(dim=0) == 0:
-                continue
+        # expert_order = []
+        # num_experts_work = 0
+        # for j in range(self.num_experts):
+        #     if tokens_comp[j].size(dim=0) == 0:
+        #         continue
 
-            num_experts_work += 1
-            if self.is_expert_loaded[j]:
-                expert_order.insert(0, j)
-            else:
-                expert_order.append(j)
+        #     num_experts_work += 1
+        #     if self.is_expert_loaded[j]:
+        #         expert_order.insert(0, j)
+        #     else:
+        #         expert_order.append(j)
 
-        # With our expert order make sure we saturate the number of experts we can have
-        # First let us see which experts in our topo is not being used
-        loaded_experts_not_in_use = []
-        loaded_experts_in_use = []
-        loaded_count = 0
-        for expert_idx in range(self.num_experts):
-            if self.is_expert_loaded[expert_idx]:
-                loaded_count += 1
-                if expert_idx in expert_order:
-                    loaded_experts_in_use.append(expert_idx)
-                else:
-                    if expert_idx not in self.topology[self.rank]:
-                        # We want to unload first what is not apart of the topo
-                        loaded_experts_not_in_use.insert(0, expert_idx)
-                    else:
-                        loaded_experts_not_in_use.append(expert_idx)
+        # # With our expert order make sure we saturate the number of experts we can have
+        # # First let us see which experts in our topo is not being used
+        # loaded_experts_not_in_use = []
+        # loaded_experts_in_use = []
+        # loaded_count = 0
+        # for expert_idx in range(self.num_experts):
+        #     if self.is_expert_loaded[expert_idx]:
+        #         loaded_count += 1
+        #         if expert_idx in expert_order:
+        #             loaded_experts_in_use.append(expert_idx)
+        #         else:
+        #             if expert_idx not in self.topology[self.rank]:
+        #                 # We want to unload first what is not apart of the topo
+        #                 loaded_experts_not_in_use.insert(0, expert_idx)
+        #             else:
+        #                 loaded_experts_not_in_use.append(expert_idx)
 
 
-        # Load as much as we can ahead of time
-        for expert_idx in expert_order[len(loaded_experts_in_use):]:
-            # We know each will not be loaded, since loaded is at the start
-            if loaded_count < self.max_loaded_experts:
-                self.load_expert(expert_idx)
-                loaded_count += 1
-            elif len(loaded_experts_not_in_use) > 0:
-                self.unload_expert(loaded_experts_not_in_use.pop(0))
-                self.load_expert(expert_idx)
-            else:
-                # We have no options but to load later
-                break
+        # # Load as much as we can ahead of time
+        # for expert_idx in expert_order[len(loaded_experts_in_use):]:
+        #     # We know each will not be loaded, since loaded is at the start
+        #     if loaded_count < self.max_loaded_experts:
+        #         self.load_expert(expert_idx)
+        #         loaded_count += 1
+        #     elif len(loaded_experts_not_in_use) > 0:
+        #         self.unload_expert(loaded_experts_not_in_use.pop(0))
+        #         self.load_expert(expert_idx)
+        #     else:
+        #         # We have no options but to load later
+        #         break
     
 
-        for idx, j in enumerate(expert_order):
-            self.expert_loaded_events[j].synchronize()
-            tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
+        # for idx, j in enumerate(expert_order):
+        #     self.expert_loaded_events[j].synchronize()
+        #     tokens_comp[j] = self.experts[f"expert_{j}"].forward(tokens_comp[j])
 
-            # Find next job that isn't loaded
-            q = idx
-            while q+1 < num_experts_work:
-                if not self.is_expert_loaded[expert_order[q+1]]:
-                    break
-                q += 1
+        #     # Find next job that isn't loaded
+        #     q = idx
+        #     while q+1 < num_experts_work:
+        #         if not self.is_expert_loaded[expert_order[q+1]]:
+        #             break
+        #         q += 1
 
-            # Now let us load it in
-            if q+1 < num_experts_work: # Check if it is valid, invalid means all loaded
-                # We have a work order for an expert not in memory
-                self.unload_expert(j)
-                self.load_expert(expert_order[q+1])
+        #     # Now let us load it in
+        #     if q+1 < num_experts_work: # Check if it is valid, invalid means all loaded
+        #         # We have a work order for an expert not in memory
+        #         self.unload_expert(j)
+        #         self.load_expert(expert_order[q+1])
                 
         # Distribute tokens back
         for j in range(self.num_experts):
@@ -759,40 +867,40 @@ class SwitchTransformersSparseMLP(nn.Module):
         hidden_states = router_probs * next_states
 
         # Here perform any rebalancing 
-        with torch.cuda.stream(self.expert_offload_stream):
-            if self.enable_rebalancing and self.round_number == self.rebalancing_frequency:
-                self.round_number = 0
+        # with torch.cuda.stream(self.expert_offload_stream):
+        #     if self.enable_rebalancing and self.round_number == self.rebalancing_frequency:
+        #         self.round_number = 0
 
-                send = [torch.tensor(self.expert_freq, dtype=torch.int32, device="cuda") for _ in range(self.num_gpus)]
-                receive = [torch.empty(self.num_experts, dtype=torch.int32, device="cuda") for _ in range(self.num_gpus)]
+        #         send = [torch.tensor(self.expert_freq, dtype=torch.int32, device="cuda") for _ in range(self.num_gpus)]
+        #         receive = [torch.empty(self.num_experts, dtype=torch.int32, device="cuda") for _ in range(self.num_gpus)]
 
-                dist.all_to_all(receive, send)
+        #         dist.all_to_all(receive, send)
 
-                expert_freq = [0 for _ in range(self.num_experts)]
-                for i in range(self.num_gpus):
-                    for j in range(self.num_experts):
-                        expert_freq[j] += receive[i][j].item()
+        #         expert_freq = [0 for _ in range(self.num_experts)]
+        #         for i in range(self.num_gpus):
+        #             for j in range(self.num_experts):
+        #                 expert_freq[j] += receive[i][j].item()
 
-                # Everyone must have same rebalance function
-                topo = self.greedy_create_topology(expert_freq)
-                self.load_topology(topo)
+        #         # Everyone must have same rebalance function
+        #         topo = self.greedy_create_topology(expert_freq)
+        #         self.load_topology(topo)
 
-                self.expert_freq = [0 for _ in range(self.num_experts)]
-            else:
-                self.round_number += 1
+        #         self.expert_freq = [0 for _ in range(self.num_experts)]
+        #     else:
+        #         self.round_number += 1
 
-                idx = num_experts_work-1
-                # So I am not going to bother to prove this but it is quite straightforward
-                # I will never be able to unload a member of the topology
-                # If I do that means that I had to unload one because there was something not apart the topology
-                # If something is not apart of the topology then that means the last one cannot be apart
-                # because we run topology experts first. etc.
-                for j in self.topology[self.rank]:
-                    if not self.is_expert_loaded[j]:
-                        self.unload_expert(expert_order[idx])
-                        self.load_expert(j)
+        #         idx = num_experts_work-1
+        #         # So I am not going to bother to prove this but it is quite straightforward
+        #         # I will never be able to unload a member of the topology
+        #         # If I do that means that I had to unload one because there was something not apart the topology
+        #         # If something is not apart of the topology then that means the last one cannot be apart
+        #         # because we run topology experts first. etc.
+        #         for j in self.topology[self.rank]:
+        #             if not self.is_expert_loaded[j]:
+        #                 self.unload_expert(expert_order[idx])
+        #                 self.load_expert(j)
 
-                        idx -= 1
+        #                 idx -= 1
 
         return hidden_states, (router_logits, expert_index)
 
