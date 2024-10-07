@@ -394,46 +394,13 @@ class ExpertManager():
 
     #     return topo
 
-
-
-class SwitchTransformersSparseMLP(nn.Module):
-    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None, is_decoder=False):
-        super().__init__()
-        self.layer_idx = layer_idx
-
-        self.num_experts = config.num_experts
-        self.num_gpus = dist.get_world_size()
+class Scheduler():
+    def __init__(self, scheduling_policy, num_experts):
         self.rank = dist.get_rank()
-        self.config = config
-        self.is_decoder = is_decoder
+        self.num_gpus = dist.get_world_size()
+        self.num_experts = num_experts
 
-        self.tot_num_toks_send = []
-        self.num_toks_each_expert_send = [[] for _ in range(self.num_experts)]
-        self.num_toks_each_gpu_send = [[] for _ in range(self.num_gpus)]
-
-        self.tot_num_toks_recv = []
-        self.num_toks_each_expert_recv = [[] for _ in range(self.num_experts)]
-
-        self.expert_offload_stream = torch.cuda.Stream()
-        self.expert_loaded_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
-        self.max_loaded_experts = config.max_loaded_experts
-        self.enable_rebalancing = config.enable_rebalancing
-        self.rebalancing_frequency = config.rebalancing_frequency
-        self.expert_freq = [0 for _ in range(self.num_experts)]
-        self.round_number = 0
-
-        # Step 1: Get the correct router according to its class
-        self.router = SwitchTransformersTop1Router(config)
-
-        # Step 2: Get the experts (for loading)
-        self.experts = nn.ModuleDict()
-        for idx in range(self.num_experts):
-            self.experts[f"expert_{idx}"] = expert_class(config)
-
-        if self.is_decoder:
-            self.scheduler = self.schedule_deepspeed
-        else:
-            match self.config.scheduling_policy:
+        match scheduling_policy:
                 case "deepspeed":
                     self.scheduler = self.schedule_deepspeed
                 case "adnexus":
@@ -447,65 +414,20 @@ class SwitchTransformersSparseMLP(nn.Module):
                 case _:
                     print("SCHEDULING POLICY NOT IMPLEMENTED")
                     exit(1)
-        
-        self.expert_manager = ExpertManager(self.experts, config, expert_class, self.max_loaded_experts)
     
-    def expert_parallelise(self):
-        self.expert_manager.expert_parallelise()
-       
-
-    def expert_save_latencies(self, DIR=""):
-        path = f"{DIR}/moe_l{self.layer_idx}"
-        if self.is_decoder:
-            path += "_decode"
-
-        with open(f"{path}.csv", "w") as f:
-            fieldnames = ["iteration", "total number of tokens sent", "total number of tokens recv"]
-            for j in range(self.num_experts):
-                fieldnames.append(f"expert_{j} num tokens sent")
-                fieldnames.append(f"expert_{j} num tokens recv")
-            for i in range(self.num_gpus):
-                fieldnames.append(f"gpu:{i} num tokens sent")
-
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-
-            for i in range(len(self.tot_num_toks_send)):
-                dic = {
-                    "iteration": i,
-                    "total number of tokens sent": self.tot_num_toks_send[i],
-                    "total number of tokens recv": self.tot_num_toks_recv[i],
-                }
-                for j in range(self.num_experts):
-                    dic[f"expert_{j} num tokens sent"] = self.num_toks_each_expert_send[j][i]
-                    dic[f"expert_{j} num tokens recv"] = self.num_toks_each_expert_recv[j][i]
-                for j in range(self.num_gpus):
-                    dic[f"gpu:{j} num tokens sent"] = self.num_toks_each_gpu_send[j][i]
-                
-                writer.writerow(dic)
-
-
-    # FOR SCHEDULING
-    # You are to return an array with entry for each gpu for which each entry
-    # has a tuple or None value for each expert. The tuple comprises of
-    # (start,end,tokens)
-
-    def print(self, value):
-        print(f"(rank:{self.rank}) {value}")
-
-    def print_schedule(self, schedule):
-        self.print(list(map(lambda x: list(map(lambda y: y[2].shape[0] if y is not None else 0, x)), schedule)))
-
-    def schedule_deepspeed(self, hidden_states, router_mask):
+    def __call__(self, hidden_states, router_mask, topology):
+        return self.scheduler(hidden_states, router_mask, topology)
+    
+    def schedule_deepspeed(self, hidden_states, router_mask, topology):
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
         for i in range(self.num_gpus):
-            for j in self.expert_manager.topology[i]:
+            for j in topology[i]:
                 tokens = hidden_states[router_mask[:,:,j]]
                 schedule[i][j] = (0,tokens.shape[0],tokens)
         return schedule
     
     # TODO need way to update router_prob to 1 to the dropped tokens
-    def schedule_drop(self, hidden_states, router_mask):
+    def schedule_drop(self, hidden_states, router_mask, topology):
         amounts = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
         token_sizes = [hidden_states[router_mask[:,:,idx]].shape[0] for idx in range(self.num_experts)]
         avg = int(sum(token_sizes) / self.num_gpus)
@@ -514,7 +436,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
         for i in range(self.num_gpus):
-            for j in self.expert_manager.topology[i]:
+            for j in topology[i]:
                 amt_can_allocate = min(avg-num_toks_each_gpu[i], token_sizes[j])
                 if amt_can_allocate == 0:
                     break
@@ -523,10 +445,10 @@ class SwitchTransformersSparseMLP(nn.Module):
         
         return schedule
     
-    def schedule_adnexus(self, hidden_states, router_mask):
+    def schedule_adnexus(self, hidden_states, router_mask, topology):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         cur_gpu_assignment = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        for i, experts in enumerate(self.expert_manager.topology):
+        for i, experts in enumerate(topology):
             for expert in experts:
                 cur_gpu_assignment[i][expert] = expert_inputs[expert].size(dim=0)
         cur_num_tokens = list(map(lambda arr: sum(arr), cur_gpu_assignment))
@@ -587,7 +509,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                 
         return schedule 
     
-    def schedule_demeter(self, hidden_states, router_mask):
+    def schedule_demeter(self, hidden_states, router_mask, topology):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
         avg = sum(expert_sizes) // self.num_gpus
@@ -597,7 +519,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         allocation = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
         # Step 1: Initial Allocation
-        for gpu_idx, experts in enumerate(self.expert_manager.topology):
+        for gpu_idx, experts in enumerate(topology):
             for expert in experts:
                 allocation[gpu_idx][expert] = expert_sizes[expert]
 
@@ -616,7 +538,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                 # Get the offload GPU for that expert
                 offload_gpu = -1
                 for j in range(self.num_gpus):
-                    if j != i and max_expert in self.expert_manager.topology[(j+1)%self.num_gpus]:
+                    if j != i and max_expert in topology[(j+1)%self.num_gpus]:
                         offload_gpu = j
                         break
                 
@@ -648,7 +570,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         return schedule
 
-    def schedule_even_split(self, hidden_states, router_mask):
+    def schedule_even_split(self, hidden_states, router_mask, topology):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
@@ -669,6 +591,115 @@ class SwitchTransformersSparseMLP(nn.Module):
         return schedule 
 
 
+
+
+class SwitchTransformersSparseMLP(nn.Module):
+    def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None, is_decoder=False):
+        super().__init__()
+        self.layer_idx = layer_idx
+
+        self.num_experts = config.num_experts
+        self.num_gpus = dist.get_world_size()
+        self.rank = dist.get_rank()
+        self.config = config
+        self.is_decoder = is_decoder
+
+        self.tot_num_toks_send = []
+        self.num_toks_each_expert_send = [[] for _ in range(self.num_experts)]
+        self.num_toks_each_gpu_send = [[] for _ in range(self.num_gpus)]
+
+        self.tot_num_toks_recv = []
+        self.num_toks_each_expert_recv = [[] for _ in range(self.num_experts)]
+
+        self.expert_offload_stream = torch.cuda.Stream()
+        self.expert_loaded_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_experts)]
+        self.max_loaded_experts = config.max_loaded_experts
+        self.enable_rebalancing = config.enable_rebalancing
+        self.rebalancing_frequency = config.rebalancing_frequency
+        self.expert_freq = [0 for _ in range(self.num_experts)]
+        self.round_number = 0
+
+        # Step 1: Get the correct router according to its class
+        self.router = SwitchTransformersTop1Router(config)
+
+        # Step 2: Get the experts (for loading)
+        self.experts = nn.ModuleDict()
+        for idx in range(self.num_experts):
+            self.experts[f"expert_{idx}"] = expert_class(config)
+
+        self.scheduler = Scheduler(
+            self.config.scheduling_policy if not self.is_decoder else "deepspeed", 
+            self.num_experts
+        )
+
+        # if self.is_decoder:
+            
+
+        #     self.scheduler = self.schedule_deepspeed
+        # else:
+        #     match self.config.scheduling_policy:
+        #         case "deepspeed":
+        #             self.scheduler = self.schedule_deepspeed
+        #         case "adnexus":
+        #             self.scheduler = self.schedule_adnexus
+        #         case "even_split":
+        #             self.scheduler = self.schedule_even_split
+        #         case "drop":
+        #             self.scheduler = self.schedule_drop
+        #         case "demeter":
+        #             self.scheduler = self.schedule_demeter
+        #         case _:
+        #             print("SCHEDULING POLICY NOT IMPLEMENTED")
+        #             exit(1)
+        
+        self.expert_manager = ExpertManager(self.experts, config, expert_class, self.max_loaded_experts)
+    
+    def expert_parallelise(self):
+        self.expert_manager.expert_parallelise()
+       
+
+    def expert_save_latencies(self, DIR=""):
+        path = f"{DIR}/moe_l{self.layer_idx}"
+        if self.is_decoder:
+            path += "_decode"
+
+        with open(f"{path}.csv", "w") as f:
+            fieldnames = ["iteration", "total number of tokens sent", "total number of tokens recv"]
+            for j in range(self.num_experts):
+                fieldnames.append(f"expert_{j} num tokens sent")
+                fieldnames.append(f"expert_{j} num tokens recv")
+            for i in range(self.num_gpus):
+                fieldnames.append(f"gpu:{i} num tokens sent")
+
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for i in range(len(self.tot_num_toks_send)):
+                dic = {
+                    "iteration": i,
+                    "total number of tokens sent": self.tot_num_toks_send[i],
+                    "total number of tokens recv": self.tot_num_toks_recv[i],
+                }
+                for j in range(self.num_experts):
+                    dic[f"expert_{j} num tokens sent"] = self.num_toks_each_expert_send[j][i]
+                    dic[f"expert_{j} num tokens recv"] = self.num_toks_each_expert_recv[j][i]
+                for j in range(self.num_gpus):
+                    dic[f"gpu:{j} num tokens sent"] = self.num_toks_each_gpu_send[j][i]
+                
+                writer.writerow(dic)
+
+
+    # FOR SCHEDULING
+    # You are to return an array with entry for each gpu for which each entry
+    # has a tuple or None value for each expert. The tuple comprises of
+    # (start,end,tokens)
+
+    # def print(self, value):
+    #     print(f"(rank:{self.rank}) {value}")
+
+    # def print_schedule(self, schedule):
+    #     self.print(list(map(lambda x: list(map(lambda y: y[2].shape[0] if y is not None else 0, x)), schedule)))
+
     @torch.no_grad()
     def forward(self, hidden_states):
         router_mask, router_probs, router_logits = self.router(hidden_states)
@@ -685,7 +716,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         for j in range(self.num_experts):
             self.num_toks_each_expert_send[j].append(hidden_states[router_mask[:,:,j]].shape[0])
         
-        schedule = self.scheduler(hidden_states, router_mask)
+        schedule = self.scheduler(hidden_states, router_mask, self.expert_manager.topology)
 
         metadata_send = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
         metadata_recv = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
