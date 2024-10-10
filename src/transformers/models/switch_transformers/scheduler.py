@@ -42,11 +42,10 @@ class Scheduler():
             start = 0
             end = 0
             for i in range(self.num_gpus):
-                if schedule[self.rank][j][i] == 0:
-                    continue 
-                end += schedule[self.rank][j][i]
-                distribution[i].append(expert_tokens[j][start:end])
-                start = end
+                if schedule[self.rank][j][i] != 0:
+                    end += schedule[self.rank][j][i]
+                    distribution[i].append(expert_tokens[j][start:end])
+                    start = end
 
         return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty(0) for tokens in distribution]
 
@@ -62,7 +61,7 @@ class Scheduler():
         return recv
     
     # A transformation to go from tokens index by GPU to expert 
-    def group_experts(self, schedule: [[[int]]], gpu_tokens):
+    def group_experts(self, schedule: [[[int]]], gpu_tokens: [torch.Tensor]):
         expert_tokens = [[] for _ in range(self.num_experts)]
 
         for i in range(self.num_gpus):
@@ -76,9 +75,36 @@ class Scheduler():
 
         return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty(0) for tokens in expert_tokens]
 
+    # A transformation to go from tokens index by expert to GPU
+    def ungroup_experts(self, schedule: [[[int]]], expert_tokens: [torch.Tensor]):
+        gpu_tokens = [[] for _ in range(self.num_gpus)]
 
+        for j in range(self.num_experts):
+            start = 0
+            end = 0
+            for i in range(self.num_gpus):
+                if schedule[i][j][self.rank] != 0:
+                    end += schedule[i][j][self.rank]
+                    gpu_tokens[i].append(expert_tokens[j][start:end])
+                    start = end
+
+        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty(0) for tokens in gpu_tokens]
+
+    # Put appropriate updates into hidden_states
     def gather_tokens(self, schedule: [[[int]]], gpu_tokens: [torch.Tensor], hidden_states, router_mask):
-        pass
+        expert_idx = [[0,0] for _ in range(self.num_experts)]
+        for i in range(self.num_gpus):
+            start = 0
+            end = 0
+            for j in range(self.num_experts):
+                if schedule[self.rank][j][i] != 0:
+                    end += schedule[self.rank][j][i]
+                    expert_idx[j][1] += schedule[self.rank][j][i]
+                    hidden_states[router_mask[:,:,j]][expert_idx[j][0]:expert_idx[j][1]] = gpu_tokens[i][start:end]
+                    start = end
+                    expert_idx[j][0] = expert_idx[j][1]
+
+        return hidden_states
 
 
     def __call__(self, meta, topo):

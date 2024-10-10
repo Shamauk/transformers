@@ -344,7 +344,6 @@ class SwitchTransformersSparseMLP(nn.Module):
         # at specific sequence index on specific sample, rest will be 0
         
         expert_index = torch.argmax(router_mask, dim=-1)
-        next_states = hidden_states.clone()
         router_mask = router_mask.bool()
 
         num_toks_per_expert = []
@@ -376,13 +375,17 @@ class SwitchTransformersSparseMLP(nn.Module):
         
         expert_tokens = self.expert_manager.execute_job(expert_tokens, straight_exec=self.scheduling_policy in ["deepspeed", "drop"])
 
-        print("Done")
-        exit(1)
-
         tokens_recv = self.scheduler.ungroup_experts(schedule, expert_tokens)
 
-
         dist.all_to_all(tokens_send, tokens_recv)
+
+        hidden_states = self.scheduler.gather_tokens(schedule, tokens_send, hidden_states, router_mask)
+
+        hidden_states = router_probs * hidden_states
+        return hidden_states, (router_logits, expert_index)
+
+        print("DONE")
+        exit(1)
 
         # print(schedule)
         # print(list(map(lambda x: x.shape, tokens_recv)))
