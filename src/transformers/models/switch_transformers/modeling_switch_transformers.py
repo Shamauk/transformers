@@ -384,99 +384,10 @@ class SwitchTransformersSparseMLP(nn.Module):
         hidden_states = router_probs * hidden_states
         return hidden_states, (router_logits, expert_index)
 
-        print("DONE")
-        exit(1)
-
         # print(schedule)
         # print(list(map(lambda x: x.shape, tokens_recv)))
         # print(list(map(lambda x: x.shape[0], tokens_send)))
         # print(list(map(lambda x: x.shape, expert_tokens)))
-        # exit(1)
-
-       # tokens_send = [torch.zeros((0, self.config.d_model), device="cuda") for _ in range(self.num_gpus)]
-
-
-        for i in range(self.num_gpus):
-            for j, d in enumerate(schedule[i]):
-                if d is None:
-                    continue
-                tokens = d[2]
-                metadata_send[i][j] = tokens.shape[0]
-                tokens_send[i] = torch.cat((tokens_send[i], tokens), dim=0)
-            self.num_toks_each_gpu_send[i].append(tokens_send[i].shape[0])
-
-        # # Metadata all_to_all
-        # dist.all_to_all(metadata_recv, metadata_send)
-
-        tokens_recv = [torch.empty((torch.sum(metadata_recv[i]),self.config.d_model), device="cuda") for i in range(self.num_gpus)]
-        ## Stat collection
-        tot = 0
-        for j in range(self.num_experts):
-            expert_tot = 0
-            for i in range(self.num_gpus):
-                expert_tot += metadata_recv[i][j].item()
-            self.num_toks_each_expert_recv[j].append(expert_tot)
-            tot += expert_tot
-        self.tot_num_toks_recv.append(tot)
-
-        # Collect the number of tokens each expert receiving over time to rebalance
-        if self.enable_rebalancing:
-            for j in range(self.num_experts):
-                self.expert_freq[j] += self.num_toks_each_expert_recv[j][-1]
-
-        # First data all_to_all
-        dist.all_to_all(tokens_recv, tokens_send)
-
-        # Collect tokens for each expert
-        tokens_comp = [torch.empty((0, self.config.d_model), device="cuda") for _ in range(self.num_experts)]
-        metadata_comp = [[(0, (0,0)) for _ in range(self.num_gpus)] for _ in range(self.num_experts)]
-
-        for i in range(self.num_gpus):
-            start = 0
-            end = 0
-            for j in range(self.num_experts):
-                size = metadata_recv[i][j].item()
-                if size == 0:
-                    continue
-                end += size
-                tokens_comp[j] = torch.cat((tokens_recv[i][start:end], tokens_comp[j]), dim=0)
-                metadata_comp[j][i] = (size, (start,end))
-                start = end
-        
-        # Do computation
-        tokens_comp = self.expert_manager.execute_job(tokens_comp, straight_exec=self.scheduling_policy in ["deepspeed", "drop"])
-                
-        # Distribute tokens back
-        for j in range(self.num_experts):
-            start = 0
-            end = 0
-            for i in range(self.num_gpus):
-                size = metadata_comp[j][i][0]
-                if size == 0:
-                    continue
-                end += size
-                start_recv, end_recv = metadata_comp[j][i][1]
-                tokens_recv[i][start_recv:end_recv] = tokens_comp[j][start:end]
-                start = end
-
-
-        # Second data all_to_all to return tokens
-        dist.all_to_all(tokens_send, tokens_recv)
-
-        for i in range(self.num_gpus):
-            start = 0
-            end = 0
-            for j in range(self.num_experts):
-                size = metadata_send[i][j].item()
-                if size == 0:
-                    continue
-                end += size
-        
-                next_states[router_mask[:,:,j]][schedule[i][j][0]:schedule[i][j][1],:] = tokens_send[i][start:end,:]
-                start = end           
-
-        hidden_states = router_probs * next_states
-        return hidden_states, (router_logits, expert_index)
 
 
 class SwitchTransformersLayerFF(nn.Module):
