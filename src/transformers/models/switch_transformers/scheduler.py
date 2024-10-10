@@ -310,7 +310,7 @@ class Scheduler():
                             found = True
                             break
                 if not found:
-                    skipped.append((gpu_idx, expert_idx, num_tokens))
+                    skipped.append([gpu_idx, expert_idx, num_tokens])
                 
         # Now try to saturate the topology
         for i in range(len(skipped)):
@@ -321,7 +321,7 @@ class Scheduler():
                         tokens_send = min(num_tokens, avg - gpu_amt[offload_gpu_idx])
                         schedule[skipped[i][0]][skipped[i][1]][offload_gpu_idx] += tokens_send
                         gpu_amt[offload_gpu_idx] += tokens_send
-                        skipped[i] = (skipped[i][0], skipped[i][1], skipped[i][2]-tokens_send)
+                        skipped[i][2] -= tokens_send
         
         # Remove from skipped any that has no more tokens
         temp = []
