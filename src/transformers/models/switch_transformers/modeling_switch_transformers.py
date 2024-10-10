@@ -46,6 +46,9 @@ import csv
 
 import torch.distributed as dist
 
+from .scheduler import Scheduler
+from .expert_manager import ExpertManager
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "SwitchTransformersConfig"
@@ -254,358 +257,6 @@ class SwitchTransformersDenseActDense(nn.Module):
 
         return hidden_states
 
-class ExpertManager():
-    def __init__(self, experts: nn.ModuleDict, config: SwitchTransformersConfig, expert_class: nn.Module, max_loaded_experts: int):
-        self.cpu_experts = experts
-        self.num_experts = len(experts)
-        self.rank = dist.get_rank()
-        self.num_gpus = dist.get_world_size()
-        self.max_loaded_experts = max_loaded_experts
-
-        # The experts loaded in GPU memory
-        self.stream = torch.cuda.Stream()
-        with torch.cuda.stream(self.stream):
-            self.loaded_experts = [expert_class(config).cuda() for _ in range(self.max_loaded_experts)]
-
-        self.loaded_expert_at_slot = [-1 for _ in range(self.max_loaded_experts)]
-        self.is_slot_loaded = [torch.cuda.Event(enable_timing=False) for _ in range(self.max_loaded_experts)]
-
-    
-    def expert_parallelise(self):
-        self.topology = [[] for _ in range(self.num_gpus)]
-        num_experts_per_gpu = self.num_experts // self.num_gpus
-        leftover = self.num_experts % self.num_gpus
-        start = 0
-        end = 0 # Not inclusive
-        for i in range(self.num_gpus):
-            end += num_experts_per_gpu
-            if leftover > 0:
-                end += 1
-                leftover -= 1
-            
-            for j in range(start,end):
-                self.topology[i].append(j)
-
-            start = end
-
-        self.load_topology()
-    
-    def load_topology(self):
-        if len(self.topology[self.rank]) > self.max_loaded_experts:
-            raise Exception("Cannot load topology given memory requirement, consider increasing max number of loaded experts")
-        
-        for slot_idx, expert_idx in enumerate(self.topology[self.rank]):
-            if self.loaded_expert_at_slot[slot_idx] != expert_idx:
-                self.load_expert(expert_idx, slot_idx)
-    
-    def load_expert(self, expert_idx: int, load_idx: int):
-        with torch.no_grad():
-            with torch.cuda.stream(self.stream):
-                self.loaded_experts[load_idx].wi.weight.copy_(self.cpu_experts[f"expert_{expert_idx}"].wi.weight)
-                self.loaded_experts[load_idx].wo.weight.copy_(self.cpu_experts[f"expert_{expert_idx}"].wo.weight)
-                self.loaded_expert_at_slot[load_idx] = expert_idx
-                self.is_slot_loaded[load_idx].record()
-    
-    def execute_expert(self, expert_idx: int, data):
-        idx = self.expert_loaded_location(expert_idx)
-        if idx == -1:
-            raise Exception("Cannot run expert which is not already loaded")
-        
-        self.is_slot_loaded[idx].synchronize()
-        r = self.loaded_experts[idx](data)
-        return r
-        
-    
-    # Returns index of expert. Returns -1 if not loaded.
-    def expert_loaded_location(self, expert_idx):
-        idx = -1
-        for i, v in enumerate(self.loaded_expert_at_slot):
-            if v == expert_idx:
-                idx = i
-                break
-        return idx 
-    
-    def is_expert_loaded(self, expert_idx):
-        return self.expert_loaded_location(expert_idx) != -1
-    
-    def execute_job(self, workload: [], straight_exec=False):
-        if straight_exec:
-            for expert_idx in range(self.num_experts):
-                if workload[expert_idx].size(dim=0) == 0:
-                    continue
-                slot_idx = self.expert_loaded_location(expert_idx)
-                workload[expert_idx] = self.loaded_experts[slot_idx](workload[expert_idx])
-        else:
-            expert_order = []
-            num_execs = 0
-
-            # Setup
-            for expert_idx in range(self.num_experts):
-                if workload[expert_idx].size(dim=0) == 0:
-                    continue
-                
-                num_execs += 1
-                if self.is_expert_loaded(expert_idx):
-                    expert_order.insert(0, expert_idx)
-                else:
-                    expert_order.append(expert_idx)
-            
-            # TODO print(f"({self.rank}) {expert_order}")
-
-            # Start loading as many experts as possible
-            for idx, loaded_expert_idx in enumerate(self.loaded_expert_at_slot):
-                # Fill if a gap or if loaded expert not used
-                if loaded_expert_idx == -1 or loaded_expert_idx not in expert_order:
-                    n = self.next_not_loaded_expert(expert_order)
-                    if n is None:
-                        break
-
-                    self.load_expert(n, idx)
-
-            
-            # Begin execution
-            for idx, expert_idx in enumerate(expert_order):
-                slot_idx = self.expert_loaded_location(expert_idx)
-                self.is_slot_loaded[slot_idx].record()
-                workload[expert_idx] = self.loaded_experts[slot_idx](workload[expert_idx])
-                # Check if anything else needs loading
-                n = self.next_not_loaded_expert(expert_order, idx)
-                if n is not None:
-                    self.load_expert(n, slot_idx)
-            
-        return workload
-
-        
-    def next_not_loaded_expert(self, experts, start=0):
-        for idx in range(start,len(experts)):
-            if not self.is_expert_loaded(experts[idx]):
-                return experts[idx]
-        return None
-
-    # If I want to add rebalancing
-    # Return a topology
-    # def greedy_create_topology(self, expert_freq):
-    #     # TODO add penalty for number of experts on each GPU
-        
-    #     topo = [[] for _ in range(self.num_gpus)]
-    #     topo_sum = [0 for _ in range(self.num_gpus)]
-    #     for expert_idx, amt in sorted(enumerate(expert_freq), key=lambda x: x[1], reverse=True):
-    #         _min = float("inf")
-    #         min_idx = -1
-
-    #         for i in range(self.num_gpus):
-    #             if topo_sum[i] < _min and len(topo[i]) < self.max_loaded_experts:
-    #                 _min = topo_sum[i]
-    #                 min_idx = i
-            
-    #         topo_sum[min_idx] += amt
-    #         topo[min_idx].append(expert_idx)
-
-    #     return topo
-
-class Scheduler():
-    def __init__(self, scheduling_policy, config):
-        self.rank = dist.get_rank()
-        self.num_gpus = dist.get_world_size()
-        self.num_experts = config.num_experts
-        self.eq_tokens = config.eq_tokens
-
-
-        match scheduling_policy:
-                case "deepspeed":
-                    self.scheduler = self.schedule_deepspeed
-                case "adnexus":
-                    self.scheduler = self.schedule_adnexus
-                case "even_split":
-                    self.scheduler = self.schedule_even_split
-                case "drop":
-                    self.scheduler = self.schedule_drop
-                case "demeter":
-                    self.scheduler = self.schedule_demeter
-                case _:
-                    print("SCHEDULING POLICY NOT IMPLEMENTED")
-                    exit(1)
-    
-    def __call__(self, hidden_states, router_mask, topology):
-        return self.scheduler(hidden_states, router_mask, topology)
-    
-    def schedule_deepspeed(self, hidden_states, router_mask, topology):
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        for i in range(self.num_gpus):
-            for j in topology[i]:
-                tokens = hidden_states[router_mask[:,:,j]]
-                schedule[i][j] = (0,tokens.shape[0],tokens)
-        return schedule
-    
-    # TODO need way to update router_prob to 1 to the dropped tokens
-    def schedule_drop(self, hidden_states, router_mask, topology):
-        amounts = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        token_sizes = [hidden_states[router_mask[:,:,idx]].shape[0] for idx in range(self.num_experts)]
-        avg = int(sum(token_sizes) / self.num_gpus)
-        num_toks_each_gpu = [0 for _ in range(self.num_gpus)]
-
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-
-        for i in range(self.num_gpus):
-            for j in topology[i]:
-                amt_can_allocate = min(avg-num_toks_each_gpu[i], token_sizes[j])
-                if amt_can_allocate == 0:
-                    break
-                num_toks_each_gpu[i] += amt_can_allocate
-                schedule[i][j] = (0, amt_can_allocate, hidden_states[router_mask[:,:,j]][0:amt_can_allocate, :])
-        
-        return schedule
-    
-    def schedule_adnexus(self, hidden_states, router_mask, topology):
-        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        cur_gpu_assignment = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        for i, experts in enumerate(topology):
-            for expert in experts:
-                cur_gpu_assignment[i][expert] = expert_inputs[expert].size(dim=0)
-        cur_num_tokens = list(map(lambda arr: sum(arr), cur_gpu_assignment))
-        avg = int(sum(cur_num_tokens) / self.num_gpus)
-
-        for i in range(self.num_gpus):
-            while cur_num_tokens[i] > avg:
-                # Find minimum
-                _min = cur_num_tokens[0]
-                min_idx = 0
-                for j in range(self.num_gpus):
-                    if cur_num_tokens[j] < _min:
-                        _min = cur_num_tokens[j]
-                        min_idx = j
-                
-                # Check if suitable place to move tokens
-                if min_idx == i:
-                    break
-                if _min + self.eq_tokens > avg:
-                    break
-                # if _min > avg:
-                    # break
-
-                # Get the maximal expert to move
-                _max = -1
-                max_expert = -1
-                for idx, size in enumerate(cur_gpu_assignment[i]):
-                    if size > _max:
-                        _max = size
-                        max_expert = idx
-
-                # Find maximal tokens that can be sent
-                # Between how much we want to reduce and the amount the maximal expert has 
-                tokens_to_spread = min(_max, cur_num_tokens[i] - avg)
-                # Between how much we can reduce thus far and the amount we can add to minimal gpu
-                tokens_to_spread = min(tokens_to_spread, avg - cur_num_tokens[min_idx])
-
-                if tokens_to_spread < self.eq_tokens:
-                    break
-
-                # Update assignment
-                cur_gpu_assignment[i][max_expert] -= tokens_to_spread
-                cur_gpu_assignment[min_idx][max_expert] += tokens_to_spread
-
-                cur_num_tokens[i] -= tokens_to_spread
-                cur_num_tokens[min_idx] += tokens_to_spread
-
-        # Build up schedule
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-
-        for j in range(self.num_experts):
-            start = 0
-            end = 0
-            for i in range(self.num_gpus):
-                if cur_gpu_assignment[i][j] == 0:
-                    continue
-                size = cur_gpu_assignment[i][j]
-                end += size
-                schedule[i][j] = (start, end, expert_inputs[j][start:end])
-                start = end 
-                
-        return schedule 
-    
-    def schedule_demeter(self, hidden_states, router_mask, topology):
-        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
-        avg = sum(expert_sizes) // self.num_gpus
-        multiplier = 1.15
-        avg_multiplier = int(multiplier * avg)
-
-        allocation = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-
-        # Step 1: Initial Allocation
-        for gpu_idx, experts in enumerate(topology):
-            for expert in experts:
-                allocation[gpu_idx][expert] = expert_sizes[expert]
-
-        # Step 2: Rebalance
-        for i in range(self.num_gpus):
-            while sum(allocation[i]) > avg_multiplier:
-                # Get largest expert
-                max_expert = -1
-                max_amount = -1
-                for j in range(self.num_experts):
-                    if allocation[i][j] > max_amount:
-                        max_amount = allocation[i][j]
-                        max_expert = j
-
-
-                # Get the offload GPU for that expert
-                offload_gpu = -1
-                for j in range(self.num_gpus):
-                    if j != i and max_expert in topology[(j+1)%self.num_gpus]:
-                        offload_gpu = j
-                        break
-                
-                # Calculate maximal amount that can be shared 
-                amount_to_share = min(sum(allocation[i])-avg_multiplier, allocation[i][max_expert])
-                amount_to_share = min(amount_to_share, avg-sum(allocation[offload_gpu]))
-
-                # If maximal amount is zero then break
-                if amount_to_share <= 0:
-                    break
-
-                # Update
-                allocation[i][max_expert] -= amount_to_share
-                allocation[offload_gpu][max_expert] += amount_to_share
-
-        
-        # Building schedule
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-
-        for j in range(self.num_experts):
-            start = 0
-            end = 0
-            for i in range(self.num_gpus):
-                if allocation[i][j] == 0:
-                    continue
-                end += allocation[i][j]
-                schedule[i][j] = (start,end,expert_inputs[j][start:end])
-                start = end 
-
-        return schedule
-
-    def schedule_even_split(self, hidden_states, router_mask, topology):
-        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-
-        for j in range(self.num_experts):
-            if expert_inputs[j].shape[0] == 0:
-                continue
-            avg = expert_inputs[j].shape[0] // self.num_gpus
-            mod = expert_inputs[j].shape[0] % self.num_gpus
-            start = 0
-            end = 0
-            for i in range(self.num_gpus):
-                end += avg 
-                if i == 0:
-                    end += mod
-                schedule[i][j] = (start,end,expert_inputs[j][start:end])
-                start = end 
-        
-        return schedule 
-
-
-
 
 class SwitchTransformersSparseMLP(nn.Module):
     def __init__(self, config: SwitchTransformersConfig, expert_class: nn.Module = SwitchTransformersDenseActDense, layer_idx=None, is_decoder=False):
@@ -643,8 +294,9 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.experts[f"expert_{idx}"] = expert_class(config)
 
         self.scheduler = Scheduler(
-            self.scheduling_policy if not self.is_decoder else "deepspeed", 
-            config
+            scheduling_policy=self.scheduling_policy if not self.is_decoder else "deepspeed", 
+            num_experts=config.num_experts,
+            eq_tokens=config.eq_tokens,
         )
 
         self.expert_manager = ExpertManager(self.experts, config, expert_class, self.max_loaded_experts)
@@ -694,16 +346,27 @@ class SwitchTransformersSparseMLP(nn.Module):
         next_states = hidden_states.clone()
         router_mask = router_mask.bool()
 
+        num_toks_per_expert = []
+
         # Collect some stats
         self.tot_num_toks_send.append(hidden_states.shape[0]*hidden_states.shape[1])
         for j in range(self.num_experts):
-            self.num_toks_each_expert_send[j].append(hidden_states[router_mask[:,:,j]].shape[0])
+            size = hidden_states[router_mask[:,:,j]].shape[0]
+            self.num_toks_each_expert_send[j].append(size)
+            num_toks_per_expert.append(size)
         
-        schedule = self.scheduler(hidden_states, router_mask, self.expert_manager.topology)
-        # TODO print(f"({self.rank},{self.layer_idx}) {[[schedule[i][j][2].shape[0] if schedule[i][j] is not None else 0 for j in range(self.num_experts) ]for i in range(self.num_gpus)]}")
-
-        metadata_send = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
+        metadata_send = [torch.tensor(num_toks_per_expert, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
         metadata_recv = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
+
+        # Metadata all_to_all
+        dist.all_to_all(metadata_recv, metadata_send)
+
+        schedule = self.scheduler(metadata_recv, self.expert_manager.get_topology())
+
+
+
+
+       # schedule = self.scheduler(hidden_states, router_mask, self.expert_manager.topology)
 
         tokens_send = [torch.zeros((0, self.config.d_model), device="cuda") for _ in range(self.num_gpus)]
 
@@ -716,8 +379,8 @@ class SwitchTransformersSparseMLP(nn.Module):
                 tokens_send[i] = torch.cat((tokens_send[i], tokens), dim=0)
             self.num_toks_each_gpu_send[i].append(tokens_send[i].shape[0])
 
-        # Metadata all_to_all
-        dist.all_to_all(metadata_recv, metadata_send)
+        # # Metadata all_to_all
+        # dist.all_to_all(metadata_recv, metadata_send)
 
         tokens_recv = [torch.empty((torch.sum(metadata_recv[i]),self.config.d_model), device="cuda") for i in range(self.num_gpus)]
         ## Stat collection
@@ -754,8 +417,6 @@ class SwitchTransformersSparseMLP(nn.Module):
                 metadata_comp[j][i] = (size, (start,end))
                 start = end
         
-        # TODO print(f"({self.layer_idx},{self.rank}) {list(map(lambda x: x.shape[0], tokens_comp))}")
-
         # Do computation
         tokens_comp = self.expert_manager.execute_job(tokens_comp, straight_exec=self.scheduling_policy in ["deepspeed", "drop"])
                 
