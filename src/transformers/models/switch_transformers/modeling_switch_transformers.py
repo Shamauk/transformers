@@ -328,42 +328,51 @@ class ExpertManager():
     def is_expert_loaded(self, expert_idx):
         return self.expert_loaded_location(expert_idx) != -1
     
-    def execute_job(self, workload: []):
-        expert_order = []
-        num_execs = 0
+    def execute_job(self, workload: [], straight_exec=False):
+        if straight_exec:
+            for expert_idx in range(self.num_experts):
+                if workload[expert_idx].size(dim=0) == 0:
+                    continue
+                slot_idx = self.expert_loaded_location(expert_idx)
+                workload[expert_idx] = self.loaded_experts[slot_idx](workload[expert_idx])
+        else:
+            expert_order = []
+            num_execs = 0
 
-        # Setup
-        for expert_idx in range(self.num_experts):
-            if workload[expert_idx].size(dim=0) == 0:
-                continue
+            # Setup
+            for expert_idx in range(self.num_experts):
+                if workload[expert_idx].size(dim=0) == 0:
+                    continue
+                
+                num_execs += 1
+                if self.is_expert_loaded(expert_idx):
+                    expert_order.insert(0, expert_idx)
+                else:
+                    expert_order.append(expert_idx)
             
-            num_execs += 1
-            if self.is_expert_loaded(expert_idx):
-                expert_order.insert(0, expert_idx)
-            else:
-                expert_order.append(expert_idx)
+            # TODO print(f"({self.rank}) {expert_order}")
 
-        # Start loading as many experts as possible
-        for idx, loaded_expert_idx in enumerate(self.loaded_expert_at_slot):
-            # Fill if a gap or if loaded expert not used
-            if loaded_expert_idx == -1 or loaded_expert_idx not in expert_order:
-                n = self.next_not_loaded_expert(expert_order)
-                if n is None:
-                    break
+            # Start loading as many experts as possible
+            for idx, loaded_expert_idx in enumerate(self.loaded_expert_at_slot):
+                # Fill if a gap or if loaded expert not used
+                if loaded_expert_idx == -1 or loaded_expert_idx not in expert_order:
+                    n = self.next_not_loaded_expert(expert_order)
+                    if n is None:
+                        break
 
-                self.load_expert(n, idx)
+                    self.load_expert(n, idx)
 
-        
-        # Begin execution
-        for idx, expert_idx in enumerate(expert_order):
-            slot_idx = self.expert_loaded_location(expert_idx)
-            self.is_slot_loaded[slot_idx].record()
-            workload[expert_idx] = self.loaded_experts[slot_idx](workload[expert_idx])
-            # Check if anything else needs loading
-            n = self.next_not_loaded_expert(expert_order, idx)
-            if n is not None:
-                self.load_expert(n, slot_idx)
-        
+            
+            # Begin execution
+            for idx, expert_idx in enumerate(expert_order):
+                slot_idx = self.expert_loaded_location(expert_idx)
+                self.is_slot_loaded[slot_idx].record()
+                workload[expert_idx] = self.loaded_experts[slot_idx](workload[expert_idx])
+                # Check if anything else needs loading
+                n = self.next_not_loaded_expert(expert_order, idx)
+                if n is not None:
+                    self.load_expert(n, slot_idx)
+            
         return workload
 
         
@@ -623,6 +632,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.rebalancing_frequency = config.rebalancing_frequency
         self.expert_freq = [0 for _ in range(self.num_experts)]
         self.round_number = 0
+        self.scheduling_policy = self.config.scheduling_policy
 
         # Step 1: Get the correct router according to its class
         self.router = SwitchTransformersTop1Router(config)
@@ -633,7 +643,7 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.experts[f"expert_{idx}"] = expert_class(config)
 
         self.scheduler = Scheduler(
-            self.config.scheduling_policy if not self.is_decoder else "deepspeed", 
+            self.scheduling_policy if not self.is_decoder else "deepspeed", 
             config
         )
 
@@ -690,6 +700,7 @@ class SwitchTransformersSparseMLP(nn.Module):
             self.num_toks_each_expert_send[j].append(hidden_states[router_mask[:,:,j]].shape[0])
         
         schedule = self.scheduler(hidden_states, router_mask, self.expert_manager.topology)
+        # TODO print(f"({self.rank},{self.layer_idx}) {[[schedule[i][j][2].shape[0] if schedule[i][j] is not None else 0 for j in range(self.num_experts) ]for i in range(self.num_gpus)]}")
 
         metadata_send = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
         metadata_recv = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
@@ -742,9 +753,11 @@ class SwitchTransformersSparseMLP(nn.Module):
                 tokens_comp[j] = torch.cat((tokens_recv[i][start:end], tokens_comp[j]), dim=0)
                 metadata_comp[j][i] = (size, (start,end))
                 start = end
+        
+        # TODO print(f"({self.layer_idx},{self.rank}) {list(map(lambda x: x.shape[0], tokens_comp))}")
 
         # Do computation
-        tokens_comp = self.expert_manager.execute_job(tokens_comp)
+        tokens_comp = self.expert_manager.execute_job(tokens_comp, straight_exec=self.scheduling_policy in ["deepspeed", "drop"])
                 
         # Distribute tokens back
         for j in range(self.num_experts):
