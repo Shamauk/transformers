@@ -297,6 +297,7 @@ class SwitchTransformersSparseMLP(nn.Module):
             scheduling_policy=self.scheduling_policy if not self.is_decoder else "deepspeed", 
             num_experts=config.num_experts,
             eq_tokens=config.eq_tokens,
+            d_model=config.d_model,
         )
 
         self.expert_manager = ExpertManager(self.experts, config, expert_class, self.max_loaded_experts)
@@ -361,14 +362,36 @@ class SwitchTransformersSparseMLP(nn.Module):
         # Metadata all_to_all
         dist.all_to_all(metadata_recv, metadata_send)
 
+        # Create global schedule
         schedule = self.scheduler(metadata_recv, self.expert_manager.get_topology())
 
+        # Turn schedule and hidden_states into array of tensors
+        # to distribute to each GPU
+        tokens_send = self.scheduler.distribute_tokens(schedule, [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)])
+        tokens_recv = self.scheduler.allocate_recv_tensors(schedule)
+        
+        dist.all_to_all(tokens_recv, tokens_send)
+
+        expert_tokens = self.scheduler.group_experts(schedule, tokens_recv)
+        
+        expert_tokens = self.expert_manager.execute_job(expert_tokens, straight_exec=self.scheduling_policy in ["deepspeed", "drop"])
+
+        print("Done")
+        exit(1)
+
+        tokens_recv = self.scheduler.ungroup_experts(schedule, expert_tokens)
 
 
+        dist.all_to_all(tokens_send, tokens_recv)
 
-       # schedule = self.scheduler(hidden_states, router_mask, self.expert_manager.topology)
+        # print(schedule)
+        # print(list(map(lambda x: x.shape, tokens_recv)))
+        # print(list(map(lambda x: x.shape[0], tokens_send)))
+        # print(list(map(lambda x: x.shape, expert_tokens)))
+        # exit(1)
 
-        tokens_send = [torch.zeros((0, self.config.d_model), device="cuda") for _ in range(self.num_gpus)]
+       # tokens_send = [torch.zeros((0, self.config.d_model), device="cuda") for _ in range(self.num_gpus)]
+
 
         for i in range(self.num_gpus):
             for j, d in enumerate(schedule[i]):

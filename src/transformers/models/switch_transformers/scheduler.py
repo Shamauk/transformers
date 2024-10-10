@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 class Scheduler():
-    def __init__(self, scheduling_policy="deepspeed", num_experts=8, eq_tokens=150, num_gpus=None):
+    def __init__(self, scheduling_policy="deepspeed", num_experts=8, eq_tokens=150, num_gpus=None, d_model=768):
         if num_gpus is None:
             self.rank = dist.get_rank()
             self.num_gpus = dist.get_world_size()
@@ -13,6 +13,7 @@ class Scheduler():
             self.num_gpus = num_gpus
         self.num_experts = num_experts
         self.eq_tokens = eq_tokens
+        self.d_model = d_model
 
         match scheduling_policy:
                 case "deepspeed":
@@ -33,6 +34,52 @@ class Scheduler():
     
     # def __call__(self, hidden_states, router_mask, topology):
     #     return self.scheduler(hidden_states, router_mask, topology)
+
+    def distribute_tokens(self, schedule: [[[int]]], expert_tokens: [torch.Tensor]):
+        distribution = [[] for _ in range(self.num_gpus)]
+
+        for j in range(self.num_experts):
+            start = 0
+            end = 0
+            for i in range(self.num_gpus):
+                if schedule[self.rank][j][i] == 0:
+                    continue 
+                end += schedule[self.rank][j][i]
+                distribution[i].append(expert_tokens[j][start:end])
+                start = end
+
+        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty(0) for tokens in distribution]
+
+    def allocate_recv_tensors(self, schedule: [[[int]]]):
+        recv = []
+
+        for i in range(self.num_gpus):
+            num_tokens = 0
+            for j in range(self.num_experts):
+                num_tokens += schedule[i][j][self.rank]
+            recv.append(torch.empty((num_tokens, self.d_model), device="cuda"))
+        
+        return recv
+    
+    # A transformation to go from tokens index by GPU to expert 
+    def group_experts(self, schedule: [[[int]]], gpu_tokens):
+        expert_tokens = [[] for _ in range(self.num_experts)]
+
+        for i in range(self.num_gpus):
+            start = 0
+            end = 0
+            for j in range(self.num_experts):
+                if schedule[i][j][self.rank] != 0:
+                    end += schedule[i][j][self.rank]
+                    expert_tokens[j].append(gpu_tokens[i][start:end])
+                    start = end
+
+        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty(0) for tokens in expert_tokens]
+
+
+    def gather_tokens(self, schedule: [[[int]]], gpu_tokens: [torch.Tensor], hidden_states, router_mask):
+        pass
+
 
     def __call__(self, meta, topo):
         return self.scheduler(meta, topo)
@@ -341,30 +388,5 @@ class Scheduler():
                 gpu_amt[min_offload_gpu_idx] += num_tokens
                 gpu_experts[min_offload_gpu_idx].append(skip[1])
                 # We are guaranteed finished here
-
-        # TODO can remove this an instead have schedule that is built different
-        # # TODO Let us have a way to collect the number of tokens within a GPU expert
-        # # When designated to same offload GPU
-        # # TODO sort too!
-        # # We want to collect all the tokens a specific GPU expert decides to send to another GPU
-        # # Because of the multiple parts of the above algorithm, it is possible that there
-        # # are multiple entries destined to the same expert.
-        # # Furthermore, want to sort it based on incremental order of destination GPU  
-        # schedule_cleaned = [[[] for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        # for i in range(self.num_gpus):
-        #     for j in range(self.num_experts):
-        #         for k in range(len(schedule[i][j])):
-        #             appened = False
-        #             index = 0
-        #             for l in range(len(schedule_cleaned[i][j])):
-        #                 if schedule_cleaned[i][j][l][0] == schedule[i][j][k][0]:
-        #                     schedule_cleaned[i][j][l] = (schedule_cleaned[i][j][l][0], 
-        #                         schedule_cleaned[i][j][l][1]+schedule[i][j][k][1])
-        #                     appened = True
-        #                     break
-        #                 elif schedule[i][j][k][0] < schedule_cleaned[i][j][l][0]:
-        #                     index = l
-        #             if not appened:
-        #                 schedule_cleaned[i][j].insert(index, schedule[i][j][k])
 
         return schedule
