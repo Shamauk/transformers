@@ -363,7 +363,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         # Create global schedule
         schedule = self.scheduler(metadata_recv, self.expert_manager.get_topology())
-
+      
         # Turn schedule and hidden_states into array of tensors
         # to distribute to each GPU
         tokens_send = self.scheduler.distribute_tokens(schedule, [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)])

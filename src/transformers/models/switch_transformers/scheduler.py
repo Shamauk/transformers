@@ -17,6 +17,7 @@ class Scheduler():
 
         match scheduling_policy:
                 case "deepspeed":
+                    self.deepspeed_topo = self.generate_deepspeed_topo()
                     self.scheduler = self.schedule_deepspeed
                 case "adnexus":
                     self.scheduler = self.schedule_adnexus
@@ -35,6 +36,10 @@ class Scheduler():
     # def __call__(self, hidden_states, router_mask, topology):
     #     return self.scheduler(hidden_states, router_mask, topology)
 
+    # meta: []
+    def __call__(self, meta, topo):
+        return self.scheduler(meta, topo)
+
     def distribute_tokens(self, schedule: [[[int]]], expert_tokens: [torch.Tensor]):
         distribution = [[] for _ in range(self.num_gpus)]
 
@@ -47,7 +52,7 @@ class Scheduler():
                     distribution[i].append(expert_tokens[j][start:end])
                     start = end
 
-        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty(0) for tokens in distribution]
+        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty((0, self.d_model), device="cuda") for tokens in distribution]
 
     def allocate_recv_tensors(self, schedule: [[[int]]]):
         recv = []
@@ -73,7 +78,7 @@ class Scheduler():
                     expert_tokens[j].append(gpu_tokens[i][start:end])
                     start = end
 
-        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty(0) for tokens in expert_tokens]
+        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty((0, self.d_model), device="cuda") for tokens in expert_tokens]
 
     # A transformation to go from tokens index by expert to GPU
     def ungroup_experts(self, schedule: [[[int]]], expert_tokens: [torch.Tensor]):
@@ -88,7 +93,7 @@ class Scheduler():
                     gpu_tokens[i].append(expert_tokens[j][start:end])
                     start = end
 
-        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty(0) for tokens in gpu_tokens]
+        return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty((0, self.d_model), device="cuda") for tokens in gpu_tokens]
 
     # Put appropriate updates into hidden_states
     def gather_tokens(self, schedule: [[[int]]], gpu_tokens: [torch.Tensor], hidden_states, router_mask):
@@ -105,19 +110,42 @@ class Scheduler():
                     expert_idx[j][0] = expert_idx[j][1]
 
         return hidden_states
-
-
-    def __call__(self, meta, topo):
-        return self.scheduler(meta, topo)
     
-    def schedule_deepspeed(self, hidden_states, router_mask, topology):
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+    def generate_deepspeed_topo(self):
+        topology = [[] for _ in range(self.num_gpus)]
+        num_experts_per_gpu = self.num_experts // self.num_gpus
+        leftover = self.num_experts % self.num_gpus
+        start = 0
+        end = 0 # Not inclusive
         for i in range(self.num_gpus):
-            for j in topology[i]:
-                tokens = hidden_states[router_mask[:,:,j]]
-                schedule[i][j] = (0,tokens.shape[0],tokens)
+            end += num_experts_per_gpu
+            if leftover > 0:
+                end += 1
+                leftover -= 1
+            
+            for j in range(start,end):
+                topology[i].append(j)
+
+            start = end
+        return topology
+    
+    def schedule_deepspeed(self, meta, topo):
+        schedule = [[[0 for _ in range(self.num_gpus)] for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+        for i in range(self.num_gpus): # source
+            for j in range(self.num_experts): # expert
+                target = -1
+                for k in range(self.num_gpus):
+                    if j in topo[k]:
+                        target = k 
+                        break
+                if target == -1:
+                    raise Exception("Failure on the deck: there is an expert overboard")
+                schedule[i][j][target] = meta[i][j].item()
+        
         return schedule
     
+    # TODO FIX FOR NEW SYSTEM
     # TODO need way to update router_prob to 1 to the dropped tokens
     def schedule_drop(self, hidden_states, router_mask, topology):
         amounts = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
@@ -137,6 +165,7 @@ class Scheduler():
         
         return schedule
     
+    # TODO FIX FOR NEW SYSTEM
     def schedule_adnexus(self, hidden_states, router_mask, topology):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         cur_gpu_assignment = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
@@ -204,6 +233,7 @@ class Scheduler():
                 
         return schedule 
     
+    # TODO FIX FOR NEW SYSTEM
     def schedule_demeter(self, hidden_states, router_mask, topology):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
@@ -265,6 +295,7 @@ class Scheduler():
 
         return schedule
 
+    # TODO FIX FOR NEW SYSTEM
     def schedule_even_split(self, hidden_states, router_mask, topology):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
