@@ -313,11 +313,6 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         with open(f"{path}.csv", "w") as f:
             fieldnames = ["iteration", "total number of tokens sent", "total number of tokens recv"]
-            for j in range(self.num_experts):
-                fieldnames.append(f"expert_{j} num tokens sent")
-                fieldnames.append(f"expert_{j} num tokens recv")
-            for i in range(self.num_gpus):
-                fieldnames.append(f"gpu:{i} num tokens sent")
 
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -328,12 +323,7 @@ class SwitchTransformersSparseMLP(nn.Module):
                     "total number of tokens sent": self.tot_num_toks_send[i],
                     "total number of tokens recv": self.tot_num_toks_recv[i],
                 }
-                for j in range(self.num_experts):
-                    dic[f"expert_{j} num tokens sent"] = self.num_toks_each_expert_send[j][i]
-                    dic[f"expert_{j} num tokens recv"] = self.num_toks_each_expert_recv[j][i]
-                for j in range(self.num_gpus):
-                    dic[f"gpu:{j} num tokens sent"] = self.num_toks_each_gpu_send[j][i]
-                
+             
                 writer.writerow(dic)
 
     @torch.no_grad()
@@ -349,11 +339,12 @@ class SwitchTransformersSparseMLP(nn.Module):
         num_toks_per_expert = []
 
         # Collect some stats
-        self.tot_num_toks_send.append(hidden_states.shape[0]*hidden_states.shape[1])
+        tot = 0
         for j in range(self.num_experts):
             size = hidden_states[router_mask[:,:,j]].shape[0]
-            self.num_toks_each_expert_send[j].append(size)
             num_toks_per_expert.append(size)
+            tot += size
+        self.tot_num_toks_send.append(tot)
         
         metadata_send = [torch.tensor(num_toks_per_expert, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
         metadata_recv = [torch.zeros(self.num_experts, dtype=torch.int, device="cuda") for _ in range(self.num_gpus)]
@@ -368,6 +359,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         # to distribute to each GPU
         tokens_send = self.scheduler.distribute_tokens(schedule, [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)])
         tokens_recv = self.scheduler.allocate_recv_tensors(schedule)
+        self.tot_num_toks_recv.append(sum(list(map(lambda x: x.shape[0], tokens_recv))))
         
         dist.all_to_all(tokens_recv, tokens_send)
 
@@ -383,11 +375,6 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         hidden_states = router_probs * hidden_states
         return hidden_states, (router_logits, expert_index)
-
-        # print(schedule)
-        # print(list(map(lambda x: x.shape, tokens_recv)))
-        # print(list(map(lambda x: x.shape[0], tokens_send)))
-        # print(list(map(lambda x: x.shape, expert_tokens)))
 
 
 class SwitchTransformersLayerFF(nn.Module):
