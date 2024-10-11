@@ -40,19 +40,32 @@ class Scheduler():
     def __call__(self, meta, topo):
         return self.scheduler(meta, topo)
 
-    def distribute_tokens(self, schedule: [[[int]]], expert_tokens: [torch.Tensor]):
+    def distribute_tokens(self, schedule: [[[int]]], hidden_states, router_mask):
         distribution = [[] for _ in range(self.num_gpus)]
 
         for j in range(self.num_experts):
             start = 0
-            end = 0
             for i in range(self.num_gpus):
                 if schedule[self.rank][j][i] != 0:
-                    end += schedule[self.rank][j][i]
-                    distribution[i].append(expert_tokens[j][start:end])
-                    start = end
+                    size = schedule[self.rank][j][i]
+                    distribution[i].append(hidden_states[router_mask[:,:,j]][start:start+size,:])
+                    start += size
 
         return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty((0, self.d_model), device="cuda") for tokens in distribution]
+    
+    # Put appropriate updates into hidden_states
+    def gather_tokens(self, schedule: [[[int]]], gpu_tokens: [torch.Tensor], hidden_states, router_mask):
+        expert_start_idx = [0 for _ in range(self.num_experts)]
+        for i in range(self.num_gpus):
+            start = 0
+            for j in range(self.num_experts):
+                if schedule[self.rank][j][i] != 0:
+                    size = schedule[self.rank][j][i]
+                    hidden_states[router_mask[:,:,j]][expert_start_idx[j]:expert_start_idx[j]+size,:] = gpu_tokens[i][start:start+size,:]
+                    start += size
+                    expert_start_idx[j] += size
+
+        return hidden_states
 
     def allocate_recv_tensors(self, schedule: [[[int]]]):
         recv = []
@@ -94,22 +107,6 @@ class Scheduler():
                     start = end
 
         return [torch.cat(tokens, dim=0) if len(tokens) != 0 else torch.empty((0, self.d_model), device="cuda") for tokens in gpu_tokens]
-
-    # Put appropriate updates into hidden_states
-    def gather_tokens(self, schedule: [[[int]]], gpu_tokens: [torch.Tensor], hidden_states, router_mask):
-        expert_idx = [[0,0] for _ in range(self.num_experts)]
-        for i in range(self.num_gpus):
-            start = 0
-            end = 0
-            for j in range(self.num_experts):
-                if schedule[self.rank][j][i] != 0:
-                    end += schedule[self.rank][j][i]
-                    expert_idx[j][1] += schedule[self.rank][j][i]
-                    hidden_states[router_mask[:,:,j]][expert_idx[j][0]:expert_idx[j][1]] = gpu_tokens[i][start:end]
-                    start = end
-                    expert_idx[j][0] = expert_idx[j][1]
-
-        return hidden_states
     
     def generate_deepspeed_topo(self):
         topology = [[] for _ in range(self.num_gpus)]
@@ -233,7 +230,8 @@ class Scheduler():
                 
         return schedule 
     
-    # TODO FIX FOR NEW SYSTEM
+    # OUTDATED
+    # Do not use as has not been updated to the latest engine requirements
     def schedule_demeter(self, hidden_states, router_mask, topology):
         expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
         expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
@@ -345,11 +343,10 @@ class Scheduler():
                 
         # Now try to saturate the topology
         for i in range(len(skipped)):
-            num_tokens = skipped[i][2]
             for offload_gpu_idx in range(self.num_gpus):
                 if skipped[i][1] in topology[offload_gpu_idx]:
                     if gpu_amt[offload_gpu_idx] < avg: # Expert already exists so no need for eq tokens
-                        tokens_send = min(num_tokens, avg - gpu_amt[offload_gpu_idx])
+                        tokens_send = min(skipped[i][2], avg - gpu_amt[offload_gpu_idx])
                         schedule[skipped[i][0]][skipped[i][1]][offload_gpu_idx] += tokens_send
                         gpu_amt[offload_gpu_idx] += tokens_send
                         skipped[i][2] -= tokens_send
@@ -370,20 +367,19 @@ class Scheduler():
             # This is not redundant to the above because a previous skip could have added a new expert to a GPU
             resolved = False
             for offload_gpu_idx in range(self.num_gpus):
+                if num_tokens == 0:
+                    break
                 if skip[1] in gpu_experts[offload_gpu_idx]:
                     if gpu_amt[offload_gpu_idx] < avg:
                         tokens_send = min(num_tokens, avg - gpu_amt[offload_gpu_idx])
                         schedule[skip[0]][skip[1]][offload_gpu_idx] += tokens_send
                         gpu_amt[offload_gpu_idx] += tokens_send
                         num_tokens -= tokens_send
-                        if num_tokens == 0:
-                            resolved = True
-                            break
-            if resolved:
+            if num_tokens == 0:
                 continue # Let us rebalance the next skipped token set
 
             # Then we will look for minimal GPU and if that GPU has atleast eq_tokens space less than avg
-            if num_tokens > self.eq_tokens:
+            while num_tokens > self.eq_tokens:
                 min_gpu_idx = 0
                 _min = gpu_amt[0]
                 for offload_gpu_idx in range(self.num_gpus):
@@ -396,9 +392,9 @@ class Scheduler():
                     gpu_experts[min_gpu_idx].append(skip[1])
                     gpu_amt[min_gpu_idx] += tokens_send
                     num_tokens -= tokens_send
-                    if num_tokens == 0:
-                        resolved = True
-            if resolved:
+                else:
+                    break
+            if num_tokens == 0:
                 continue # Let us rebalance the next skipped token set
 
             # Otherwise we split evenly the tokens across the gpus with the expert already
@@ -414,13 +410,14 @@ class Scheduler():
                 target = int((sum(map(lambda x: gpu_amt[x], offloaders)) + num_tokens) / len(offloaders))
                 # Fill each to the target
                 for offload_gpu_idx in offloaders:
+                    if num_tokens == 0:
+                        break
                     if gpu_amt[offload_gpu_idx] < target:
                         tokens_send = min(num_tokens, target - gpu_amt[offload_gpu_idx])
                         schedule[skip[0]][skip[1]][offload_gpu_idx] += tokens_send
                         gpu_amt[offload_gpu_idx] += tokens_send
                         num_tokens -= tokens_send
-                        if num_tokens == 0:
-                            break
+
                 # If in really rare case there are still leftover tokens then just give all to the one with the least
                 if num_tokens > 0:
                     min_offload_gpu_idx = offloaders[0]
