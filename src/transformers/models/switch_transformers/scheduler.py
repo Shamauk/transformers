@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import random
 
 import torch.distributed as dist
 
@@ -15,28 +16,27 @@ class Scheduler():
         self.eq_tokens = eq_tokens
         self.d_model = d_model
 
-        match scheduling_policy:
-                case "deepspeed":
-                    self.deepspeed_topo = self.generate_deepspeed_topo()
-                    self.scheduler = self.schedule_deepspeed
-                case "adnexus":
-                    self.scheduler = self.schedule_adnexus
-                case "even_split":
-                    self.scheduler = self.schedule_even_split
-                case "drop":
-                    self.scheduler = self.schedule_drop
-                case "demeter":
-                    self.scheduler = self.schedule_demeter
-                case "adfabricus":
-                    self.scheduler = self.schedule_adfabricus
-                case _:
-                    print("SCHEDULING POLICY NOT IMPLEMENTED")
-                    exit(1)
-    
-    # def __call__(self, hidden_states, router_mask, topology):
-    #     return self.scheduler(hidden_states, router_mask, topology)
+        self.deepspeed_topo = self.generate_deepspeed_topo()
+        self.demeter_offload_topo = self.generate_deepspeed_topo()
+        random.shuffle(self.demeter_offload_topo)
 
-    # meta: []
+        match scheduling_policy:
+            case "deepspeed":
+                self.scheduler = self.schedule_deepspeed
+            case "adnexus":
+                self.scheduler = self.schedule_adnexus
+            case "even_split":
+                self.scheduler = self.schedule_even_split
+            case "drop":
+                self.scheduler = self.schedule_drop
+            case "demeter":
+                self.scheduler = self.schedule_demeter
+            case "adfabricus":
+                self.scheduler = self.schedule_adfabricus
+            case _:
+                print("SCHEDULING POLICY NOT IMPLEMENTED")
+                exit(1)
+    
     def __call__(self, meta, topo):
         return self.scheduler(meta, topo)
 
@@ -63,7 +63,6 @@ class Scheduler():
                     size = schedule[self.rank][j][i]
                     hidden_states[router_mask[:,:,j]][expert_start_idx[j]:expert_start_idx[j]+size,:] = gpu_tokens[i][start:start+size,:]
                     start += size
-                    expert_start_idx[j] += size
 
         return hidden_states
 
@@ -126,14 +125,14 @@ class Scheduler():
             start = end
         return topology
     
-    def schedule_deepspeed(self, meta, topo):
+    def schedule_deepspeed(self, meta, _):
         schedule = [[[0 for _ in range(self.num_gpus)] for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
         for i in range(self.num_gpus): # source
             for j in range(self.num_experts): # expert
                 target = -1
                 for k in range(self.num_gpus):
-                    if j in topo[k]:
+                    if j in self.deepspeed_topo[k]:
                         target = k 
                         break
                 if target == -1:
@@ -141,178 +140,256 @@ class Scheduler():
                 schedule[i][j][target] = meta[i][j].item()
         
         return schedule
-    
-    # TODO FIX FOR NEW SYSTEM
-    # TODO need way to update router_prob to 1 to the dropped tokens
-    def schedule_drop(self, hidden_states, router_mask, topology):
-        amounts = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        token_sizes = [hidden_states[router_mask[:,:,idx]].shape[0] for idx in range(self.num_experts)]
-        avg = int(sum(token_sizes) / self.num_gpus)
-        num_toks_each_gpu = [0 for _ in range(self.num_gpus)]
 
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+    def schedule_drop(self, meta, _):
+        schedule = [[[0 for _ in range(self.num_gpus)] for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+        avg = int(sum(map(lambda t: sum(t).item(), meta)) / self.num_gpus) 
+        gpu_amt = [0 for _ in range(self.num_gpus)]
+        for i in range(self.num_gpus): # source
+            for j in range(self.num_experts): # expert
+                num_tokens = meta[i][j].item()
+                if num_tokens == 0:
+                    continue # We do not have work for this one
+                start_idx = 0
+                for k in range(self.num_gpus): # dest
+                    if j in self.deepspeed_topo[k]:
+                        if gpu_amt[k] < avg:
+                            num_tokens_send = min(num_tokens, avg - gpu_amt[k])
+                            schedule[i][j][k] = num_tokens_send
+                            gpu_amt[k] += num_tokens_send
+
+        return schedule
+
+    def schedule_adnexus(self, meta, topology):
+        schedule = self.schedule_deepspeed(meta, topology)
+        avg = int(sum(map(lambda t: sum(t).item(), meta)) / self.num_gpus) 
+
+        # Now we should rebalance it
+        gpu_amt = [0 for _ in range(self.num_gpus)]
+
+        # Let us first get all the amounts on each gpu 
+        for i in range(self.num_gpus):
+            for j in range(self.num_experts):
+                for k in range(self.num_gpus):
+                    gpu_amt[i] += schedule[k][j][i]
 
         for i in range(self.num_gpus):
-            for j in topology[i]:
-                amt_can_allocate = min(avg-num_toks_each_gpu[i], token_sizes[j])
-                if amt_can_allocate == 0:
+            while gpu_amt[i] > avg: # GPU i is received too many tokens
+                # Find gpu sending me the most tokens
+                most_tokens = 0
+                sender_idx = -1
+                for k in range(self.num_gpus):
+                    tot = 0
+                    for j in range(self.num_experts):
+                        tot += schedule[k][j][i]
+                    if tot > most_tokens:
+                        most_tokens = tot
+                        sender_idx = k
+                
+                if most_tokens == 0:
+                    break # No one is sending tokens... just in case
+                
+                # Next find the expert sending the most from sender_idx
+                most_tokens = 0
+                expert_idx = -1
+                for j in range(self.num_experts):
+                    if schedule[sender_idx][j][i] > most_tokens:
+                        most_tokens = schedule[sender_idx][j][i]
+                        expert_idx = j
+                
+                if most_tokens == 0:
+                    break # This should not happen as the previous check passed
+                
+                if most_tokens < self.eq_tokens:
+                    break # Cannot do move, not enough tokens
+
+                # Find GPU with least tokens
+                least = gpu_amt[0]
+                least_idx = 0
+                for k in range(self.num_gpus):
+                    if gpu_amt[k] < least:
+                        least = gpu_amt[k]
+                        least_idx = k
+                
+                if least == i:
+                    break # Don't offload to yourself
+                
+                # Check if least has enough room
+                if least + self.eq_tokens > avg:
                     break
-                num_toks_each_gpu[i] += amt_can_allocate
-                schedule[i][j] = (0, amt_can_allocate, hidden_states[router_mask[:,:,j]][0:amt_can_allocate, :])
+                
+
+                # Next we do the move now
+                tokens_send = min(most_tokens, avg - least)
+                schedule[sender_idx][expert_idx][i] -= tokens_send
+                gpu_amt[i] -= tokens_send
+                schedule[sender_idx][expert_idx][least_idx] += tokens_send
+                gpu_amt[least_idx] += tokens_send
         
         return schedule
+
     
-    # TODO FIX FOR NEW SYSTEM
-    def schedule_adnexus(self, hidden_states, router_mask, topology):
-        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        cur_gpu_assignment = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-        for i, experts in enumerate(topology):
-            for expert in experts:
-                cur_gpu_assignment[i][expert] = expert_inputs[expert].size(dim=0)
-        cur_num_tokens = list(map(lambda arr: sum(arr), cur_gpu_assignment))
-        avg = int(sum(cur_num_tokens) / self.num_gpus)
+    def schedule_demeter(self, meta, topology):
+        schedule = self.schedule_deepspeed(meta, topology)
+        avg = int(sum(map(lambda t: sum(t).item(), meta)) / self.num_gpus)
+
+        gpu_amt = [0 for _ in range(self.num_gpus)]
+
+        # Let us first get all the amounts on each gpu 
+        for i in range(self.num_gpus):
+            for j in range(self.num_experts):
+                for k in range(self.num_gpus):
+                    gpu_amt[i] += schedule[k][j][i]
 
         for i in range(self.num_gpus):
-            while cur_num_tokens[i] > avg:
-                # Find minimum
-                _min = cur_num_tokens[0]
-                min_idx = 0
+            while gpu_amt[i] > avg:
+            #    if self.rank == 0:
+              #      print(f"ITER: {i}")
+                # Find expert with most
+                most = -1
+                most_idx = -1
+                for j in range(self.num_experts):
+                    tot = 0
+                    for k in range(self.num_gpus):
+                        tot += schedule[k][j][i]
+                    if tot > most:
+                        most = tot
+                        most_idx = j 
+
+                if most == 0:
+                    break
+                
+               # if self.rank == 0:
+               #     print(f"Most: {most_idx}")
+
+
+                # Find gpu that is sending that expert the most
+                sender_idx = -1
+                sender_amt = -1
                 for j in range(self.num_gpus):
-                    if cur_num_tokens[j] < _min:
-                        _min = cur_num_tokens[j]
-                        min_idx = j
+                    if schedule[j][most_idx][i] > sender_amt:
+                        sender_amt = schedule[j][most_idx][i]
+                        sender_idx = j
+                        break 
                 
-                # Check if suitable place to move tokens
-                if min_idx == i:
-                    break
-                if _min + self.eq_tokens > avg:
-                    break
-                # if _min > avg:
-                    # break
+                if sender_idx == -1:
+                    raise Exception("Impossible exception occured")
 
-                # Get the maximal expert to move
-                _max = -1
-                max_expert = -1
-                for idx, size in enumerate(cur_gpu_assignment[i]):
-                    if size > _max:
-                        _max = size
-                        max_expert = idx
+             #   if self.rank == 0:
+               #     print(f"Sender: {sender_idx}")
 
-                # Find maximal tokens that can be sent
-                # Between how much we want to reduce and the amount the maximal expert has 
-                tokens_to_spread = min(_max, cur_num_tokens[i] - avg)
-                # Between how much we can reduce thus far and the amount we can add to minimal gpu
-                tokens_to_spread = min(tokens_to_spread, avg - cur_num_tokens[min_idx])
+                # Find offload GPU for that expert
+                offload_gpu_idx = -1
+                for gpu_idx, offloads in enumerate(self.demeter_offload_topo):
+                    if most_idx in offloads:
+                        offload_gpu_idx = gpu_idx
+                        break
+                if offload_gpu_idx == -1:
+                    raise Exception("Buck or two have we crashed a galley of good oars.")
 
-                if tokens_to_spread < self.eq_tokens:
-                    break
+                if gpu_amt[offload_gpu_idx] >= avg:
+                    break 
 
-                # Update assignment
-                cur_gpu_assignment[i][max_expert] -= tokens_to_spread
-                cur_gpu_assignment[min_idx][max_expert] += tokens_to_spread
+             #   if self.rank == 0:
+               #     print(f"Offload: {offload_gpu_idx}")
 
-                cur_num_tokens[i] -= tokens_to_spread
-                cur_num_tokens[min_idx] += tokens_to_spread
+                #print(f"GPU:{i} overloaded moving expert:{most_idx} from GPU:{sender_idx} to GPU:{offload_gpu_idx}")
+                # Move as much as possible
+                # If cannot move more than eq_tokens break 
+                num_tokens = min(sender_amt, avg - gpu_amt[offload_gpu_idx])
+             #   if self.rank == 0:
+               #     print(num_tokens)
+                schedule[sender_idx][most_idx][i] -= num_tokens
+                schedule[sender_idx][most_idx][offload_gpu_idx] += num_tokens
+                gpu_amt[i] -= num_tokens
+                gpu_amt[offload_gpu_idx] += num_tokens
+            #print(f"Done: {i}")
+        
+        print(schedule)
+        return schedule
 
-        # Build up schedule
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
-        for j in range(self.num_experts):
-            start = 0
-            end = 0
-            for i in range(self.num_gpus):
-                if cur_gpu_assignment[i][j] == 0:
-                    continue
-                size = cur_gpu_assignment[i][j]
-                end += size
-                schedule[i][j] = (start, end, expert_inputs[j][start:end])
-                start = end 
-                
-        return schedule 
     
     # OUTDATED
     # Do not use as has not been updated to the latest engine requirements
-    def schedule_demeter(self, hidden_states, router_mask, topology):
-        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
-        avg = sum(expert_sizes) // self.num_gpus
-        multiplier = 1.15
-        avg_multiplier = int(multiplier * avg)
+    # def schedule_demeter(self, hidden_states, router_mask, topology):
+    #     expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
+    #     expert_sizes = [expert_inputs[i].shape[0] for i in range(self.num_experts)]
+    #     avg = sum(expert_sizes) // self.num_gpus
+    #     multiplier = 1.15
+    #     avg_multiplier = int(multiplier * avg)
 
-        allocation = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+    #     allocation = [[0 for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
-        # Step 1: Initial Allocation
-        for gpu_idx, experts in enumerate(topology):
-            for expert in experts:
-                allocation[gpu_idx][expert] = expert_sizes[expert]
+    #     # Step 1: Initial Allocation
+    #     for gpu_idx, experts in enumerate(topology):
+    #         for expert in experts:
+    #             allocation[gpu_idx][expert] = expert_sizes[expert]
 
-        # Step 2: Rebalance
-        for i in range(self.num_gpus):
-            while sum(allocation[i]) > avg_multiplier:
-                # Get largest expert
-                max_expert = -1
-                max_amount = -1
-                for j in range(self.num_experts):
-                    if allocation[i][j] > max_amount:
-                        max_amount = allocation[i][j]
-                        max_expert = j
+    #     # Step 2: Rebalance
+    #     for i in range(self.num_gpus):
+    #         while sum(allocation[i]) > avg_multiplier:
+    #             # Get largest expert
+    #             max_expert = -1
+    #             max_amount = -1
+    #             for j in range(self.num_experts):
+    #                 if allocation[i][j] > max_amount:
+    #                     max_amount = allocation[i][j]
+    #                     max_expert = j
 
 
-                # Get the offload GPU for that expert
-                offload_gpu = -1
-                for j in range(self.num_gpus):
-                    if j != i and max_expert in topology[(j+1)%self.num_gpus]:
-                        offload_gpu = j
-                        break
+    #             # Get the offload GPU for that expert
+    #             offload_gpu = -1
+    #             for j in range(self.num_gpus):
+    #                 if j != i and max_expert in topology[(j+1)%self.num_gpus]:
+    #                     offload_gpu = j
+    #                     break
                 
-                # Calculate maximal amount that can be shared 
-                amount_to_share = min(sum(allocation[i])-avg_multiplier, allocation[i][max_expert])
-                amount_to_share = min(amount_to_share, avg-sum(allocation[offload_gpu]))
+    #             # Calculate maximal amount that can be shared 
+    #             amount_to_share = min(sum(allocation[i])-avg_multiplier, allocation[i][max_expert])
+    #             amount_to_share = min(amount_to_share, avg-sum(allocation[offload_gpu]))
 
-                # If maximal amount is zero then break
-                if amount_to_share <= 0:
-                    break
+    #             # If maximal amount is zero then break
+    #             if amount_to_share <= 0:
+    #                 break
 
-                # Update
-                allocation[i][max_expert] -= amount_to_share
-                allocation[offload_gpu][max_expert] += amount_to_share
+    #             # Update
+    #             allocation[i][max_expert] -= amount_to_share
+    #             allocation[offload_gpu][max_expert] += amount_to_share
 
         
-        # Building schedule
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+    #     # Building schedule
+    #     schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
 
-        for j in range(self.num_experts):
-            start = 0
-            end = 0
-            for i in range(self.num_gpus):
-                if allocation[i][j] == 0:
-                    continue
-                end += allocation[i][j]
-                schedule[i][j] = (start,end,expert_inputs[j][start:end])
-                start = end 
+    #     for j in range(self.num_experts):
+    #         start = 0
+    #         end = 0
+    #         for i in range(self.num_gpus):
+    #             if allocation[i][j] == 0:
+    #                 continue
+    #             end += allocation[i][j]
+    #             schedule[i][j] = (start,end,expert_inputs[j][start:end])
+    #             start = end 
 
+    #     return schedule
+
+    def schedule_even_split(self, meta, _):
+        schedule = [[[0 for _ in range(self.num_gpus)] for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
+
+        for i in range(self.num_gpus):
+            for j in range(self.num_experts):
+                even = meta[i][j].item() // self.num_gpus
+                leftover = meta[i][j].item() % self.num_gpus
+                for k in range(self.num_gpus):
+                    amt = even
+                    if leftover > 0:
+                        leftover -= 1
+                        amt += 1
+                    schedule[i][j][k] = amt 
+        
         return schedule
-
-    # TODO FIX FOR NEW SYSTEM
-    def schedule_even_split(self, hidden_states, router_mask, topology):
-        expert_inputs = [hidden_states[router_mask[:,:,idx]] for idx in range(self.num_experts)]
-        schedule = [[None for _ in range(self.num_experts)] for _ in range(self.num_gpus)]
-
-        for j in range(self.num_experts):
-            if expert_inputs[j].shape[0] == 0:
-                continue
-            avg = expert_inputs[j].shape[0] // self.num_gpus
-            mod = expert_inputs[j].shape[0] % self.num_gpus
-            start = 0
-            end = 0
-            for i in range(self.num_gpus):
-                end += avg 
-                if i == 0:
-                    end += mod
-                schedule[i][j] = (start,end,expert_inputs[j][start:end])
-                start = end 
-        
-        return schedule 
     
     def schedule_adfabricus(self, meta, topology):
         # num_gpus x num_experts x num_gpus

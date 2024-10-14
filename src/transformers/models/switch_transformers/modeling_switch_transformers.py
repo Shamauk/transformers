@@ -354,11 +354,6 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         # Create global schedule
         schedule = self.scheduler(metadata_recv, self.expert_manager.get_topology())
-        
-        num_tot_tokens = sum(list(map(lambda arr: sum(list(map(lambda x: x.item(), arr))), metadata_recv)))
-        num_scheduled_tokens = sum(list(map(lambda experts: sum(list(map(lambda t: sum(t), experts))), schedule)))
-        if num_tot_tokens != num_scheduled_tokens:
-            raise Exception(f"Oh Johny, have we got a problem with the ballast. Trying to work {num_scheduled_tokens} tokens from {num_tot_tokens}")
 
         # Turn schedule and hidden_states into array of tensors
         # to distribute to each GPU
@@ -374,11 +369,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         tokens_recv = self.scheduler.ungroup_experts(schedule, expert_tokens)
 
-        # if self.rank == 0:
-        #     print(list(map(lambda x: x.shape, tokens_send)))
         dist.all_to_all(tokens_send, tokens_recv)
-        # if self.rank == 0:
-        #     print(list(map(lambda x: x.shape, tokens_send)))
 
         hidden_states = self.scheduler.gather_tokens(schedule, tokens_send, hidden_states, router_mask)
 
